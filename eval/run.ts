@@ -18,12 +18,24 @@
  * 端到端也跑一遍（dispatch 之后看最终渲染了什么）：因为「模型选对了工具」
  * 和「用户看到了正确的组件」中间还隔着三道闸。只看前者，会把被闸拦掉的
  * 全部算成成功 —— 那是最危险的一种「绿」。
+ *
+ * ## 一条用例的四种结局，以及为什么必须分开
+ *
+ *   PASS / FAIL —— 系统跑完了，结论可信。这是**质量信号**，进分数。
+ *   ERROR       —— 评测自己崩了。这是**基础设施故障**，不进分数、也不算通过。
+ *   SKIP        —— review_status 不是 approved（回流的候选用例），**不进分数**。
+ *
+ * 把 ERROR 和 FAIL 混成一个「不通过」，是这个脚本最容易犯、后果最贵的错：
+ * 某天机器出问题十条用例抛异常，报告上写「准确率从 100% 掉到 92%」，
+ * 然后所有人去查 Prompt。真正该修的是机器。这两个数字分开报，一眼分得清。
  */
 
 import { readFileSync } from "node:fs";
 import { join, sep } from "node:path";
 
-import { buildRecord, compare, listRuns, saveRun } from "./history";
+import { buildRecord, compare, listRuns, runStamp, saveRun } from "./history";
+import { aggregate, computeDatasetHash, severityOf } from "./models";
+import type { CaseStatus, EvalCase, ReviewStatus } from "./models";
 
 // 与 selftest 同理：被测模块要用动态 import 引入，顶层 await 需要一个模块标记
 export {};
@@ -39,6 +51,14 @@ const limit = Number(argValue("limit") ?? "0");
 const noSave = args.includes("--no-save");
 /** 严格模式：出现回归（上次通过、这次失败）即判定失败，用于 CI 卡关 */
 const strict = args.includes("--strict");
+/**
+ * 默认不跑隔离区（review_status 不是 approved）的用例。
+ *
+ * 加上这个开关会把它们跑一遍并单独列出来，**但依然不计分** ——
+ * 加它的用途是「看一眼这条线上回流回来的用例现在过不过，好决定要不要评审它」，
+ * 不是「让它进分数」。这两件事混了，隔离区就白设了。
+ */
+const withCandidates = args.includes("--candidates");
 
 process.env.LLM_PROVIDER = provider;
 process.env.MOCK_STREAM_DELAY_MS = "0";
@@ -94,24 +114,35 @@ interface Expect {
   componentFields?: { component: string; name: string; value: string }[];
 }
 
-interface Case {
-  id: string;
-  layer: string;
-  input: string;
-  preset?: { lastOrderNo?: string; hasRefundResult?: boolean };
-  expect: Expect;
+interface GoldenSet {
+  dataset_id: string;
+  version: string;
+  cases: (Omit<EvalCase, "expect"> & { expect: Expect })[];
 }
 
-interface GoldenSet {
-  version: string;
-  cases: Case[];
-}
+type Case = GoldenSet["cases"][number];
 
 const golden = JSON.parse(
   readFileSync(join(process.cwd(), "eval", "golden-set.json"), "utf8"),
 ) as GoldenSet;
 
-const cases = golden.cases.filter((c) => !onlyLayer || c.layer === onlyLayer).slice(0, limit || undefined);
+/** 用例的内容哈希：回答「同一个用例昨天过今天不过，中间改的是用例还是代码」 */
+const datasetHash = computeDatasetHash(golden.cases);
+
+const reviewOf = (c: { review_status?: ReviewStatus }): ReviewStatus => c.review_status ?? "approved";
+
+const scoped = golden.cases.filter((c) => !onlyLayer || c.layer === onlyLayer);
+
+/**
+ * 隔离区：线上回流回来的用例，人工评审通过前不进评测。
+ *
+ * 不跑它们（默认）而不是「跑了不算分」，是个刻意的选择：
+ * 一条没评审过的用例，跑出来的结果没有任何人可以依据它做决定 ——
+ * 那就不该消耗时间和注意力。要看的时候加 `--candidates`。
+ */
+const quarantined = scoped.filter((c) => reviewOf(c) !== "approved");
+const active = scoped.filter((c) => reviewOf(c) === "approved");
+const cases = (withCandidates ? scoped : active).slice(0, limit || undefined);
 
 /* ---------- 单个用例 ---------- */
 
@@ -119,8 +150,12 @@ interface CaseResult {
   id: string;
   layer: string;
   input: string;
-  ok: boolean;
+  /** 四态，见文件头。`ok` 只是它的一个投影，保留是为了让判定逻辑读起来短 */
+  status: CaseStatus;
   reasons: string[];
+  /** ERROR 的原因。它不是「哪里没做对」，是「没测出来」，所以和 reasons 分开放 */
+  error: string;
+  weight: number;
   toolCalls: string[];
   components: string[];
   /** 上线门槛用的一组原始计数 —— 判定口径见「上线门槛」一节 */
@@ -292,8 +327,12 @@ async function runCase(c: Case): Promise<CaseResult> {
     id: c.id,
     layer: c.layer,
     input: c.input,
-    ok: reasons.length === 0,
+    // 跑到这里就一定拿到了可信结论：要么符合期望，要么不符合。
+    // 唯一会变成 ERROR 的路径是抛异常，那在调用处捕获。
+    status: reasons.length === 0 ? "pass" : "fail",
     reasons,
+    error: "",
+    weight: severityOf(c),
     toolCalls,
     components,
     metrics: {
@@ -310,35 +349,66 @@ async function runCase(c: Case): Promise<CaseResult> {
 
 /* ---------- 跑 ---------- */
 
-console.log(`评测集 v${golden.version} · provider=${getAdapter().name} · ${cases.length} 条\n`);
+console.log(
+  `评测集 ${golden.dataset_id} v${golden.version} · ${datasetHash} · provider=${getAdapter().name} · ${cases.length} 条`,
+);
+if (quarantined.length > 0 && !withCandidates) {
+  console.log(`隔离区 ${quarantined.length} 条未跑（未评审，不计分）—— 要看加 --candidates`);
+}
+console.log("");
+
+/** 中性指标：既不声明期望、也不产生调用，所以对任何门槛都是「不存在」而不是「失败」 */
+const NEUTRAL_METRICS: CaseResult["metrics"] = {
+  intentExpected: null,
+  intentGotComponent: false,
+  expectedComponents: [],
+  gotComponent: null,
+  gate1Calls: 0,
+  gate1Rejected: 0,
+  envelopeGate3: [],
+};
 
 const results: CaseResult[] = [];
+/** 隔离区用例的结果。单独放 —— 它们**永远**不进分数，展示了也只是给人看 */
+const candidateResults: CaseResult[] = [];
+
 for (const c of cases) {
+  const quarantined = reviewOf(c) !== "approved";
   try {
     const r = await runCase(c);
-    results.push(r);
-    if (!r.ok) console.log(`  ✗ ${c.id}  ${c.input}`);
+    if (quarantined) {
+      candidateResults.push(r);
+    } else {
+      results.push(r);
+      if (r.status === "fail") console.log(`  ✗ ${c.id}  ${c.input}`);
+    }
   } catch (err) {
-    results.push({
+    const reason = err instanceof Error ? err.message : String(err);
+    // 两种结局不同的处理，是这整个脚本最值得看一眼的地方：
+    //   隔离区的用例抛异常 → 无所谓，它本来就不算数
+    //   正常用例抛异常     → ERROR，**不是** FAIL
+    // 后者如果写成 FAIL，一次机器故障会被记成一次质量退步，
+    // 然后有人去改一句根本没坏的 Prompt。
+    const r: CaseResult = {
       id: c.id,
       layer: c.layer,
       input: c.input,
-      ok: false,
-      reasons: [`执行异常：${err instanceof Error ? err.message : String(err)}`],
+      status: quarantined ? "skip" : "error",
+      // reasons 留空：异常不是「哪里没做对」的清单，硬塞进去会让失败报告里
+      // 混进一批看着像断言失败、实际是崩溃的行
+      reasons: [],
+      error: reason,
+      weight: severityOf(c),
       toolCalls: [],
       components: [],
-      // 异常用例不进任何门槛指标 —— 把它算成「意图错了」是拿一个基础设施故障
-      // 去拉低模型的分，两个数字都会失真。它只出现在分层结果里。
-      metrics: {
-        intentExpected: null,
-        intentGotComponent: false,
-        expectedComponents: [],
-        gotComponent: null,
-        gate1Calls: 0,
-        gate1Rejected: 0,
-        envelopeGate3: [],
-      },
-    });
+      metrics: NEUTRAL_METRICS,
+    };
+    if (quarantined) {
+      candidateResults.push(r);
+    } else {
+      results.push(r);
+      console.log(`  ! ${c.id}  执行异常：${reason}`);
+    }
   }
 }
 
@@ -347,29 +417,73 @@ for (const c of cases) {
 const layers = [...new Set(results.map((r) => r.layer))];
 const pad = (s: string, n: number) => s + " ".repeat(Math.max(0, n - [...s].reduce((w, ch) => w + (/[一-龥]/.test(ch) ? 2 : 1), 0)));
 
+const report = aggregate({
+  ...runStamp(),
+  provider: getAdapter().name,
+  datasetId: golden.dataset_id,
+  datasetVersion: golden.version,
+  datasetHash,
+  gitCommit: null, // 由 history 去问 git，这里不重复问一次
+  results: results.map((r) => ({
+    caseId: r.id,
+    layer: r.layer,
+    status: r.status,
+    score: r.status === "pass" ? 1 : 0,
+    reasons: r.reasons,
+    error: r.error,
+    weight: r.weight,
+    input: r.input,
+  })),
+});
+
 console.log("\n分层结果");
-for (const layer of layers) {
-  const rows = results.filter((r) => r.layer === layer);
-  const ok = rows.filter((r) => r.ok).length;
-  const rate = ((ok / rows.length) * 100).toFixed(1);
-  console.log(`  ${pad(layer, 10)}${String(ok).padStart(3)}/${String(rows.length).padEnd(3)}  ${rate.padStart(5)}%`);
+for (const cs of report.categoryStats) {
+  const rate = (cs.passRate * 100).toFixed(1);
+  // 异常单独一列。混进分子的分母里，两种故障就再也分不出来了
+  const extra = cs.errored > 0 ? `  ⚠ 异常 ${cs.errored}` : "";
+  console.log(
+    `  ${pad(cs.layer, 10)}${String(cs.passed).padStart(3)}/${String(cs.passed + cs.failed).toString().padEnd(3)}  ${rate.padStart(5)}%${extra}`,
+  );
 }
 console.log(`  ${"─".repeat(34)}`);
-const totalOk = results.filter((r) => r.ok).length;
 console.log(
-  `  ${pad("合计", 10)}${String(totalOk).padStart(3)}/${String(results.length).padEnd(3)}  ${(
-    (totalOk / results.length) *
-    100
+  `  ${pad("合计", 10)}${String(report.passed).padStart(3)}/${String(report.passed + report.failed).toString().padEnd(3)}  ${(
+    report.rawPassRate * 100
   ).toFixed(1).padStart(5)}%`,
 );
+console.log(
+  `  ${pad("加权得分", 10)}${(report.weightedScore * 100).toFixed(1).padStart(5)}%   （按层严重度加权：对抗 ×5、操作 ×3、展示 ×2、闲聊 ×1）`,
+);
+if (report.errored > 0 || report.skipped > 0) {
+  console.log(
+    `  ${pad("未计分", 10)}${String(report.errored + report.skipped).padStart(3)} 条   （异常 ${report.errored} · 隔离区 ${report.skipped}）—— 不进上面任何数字`,
+  );
+}
 
-const failed = results.filter((r) => !r.ok);
+const failed = results.filter((r) => r.status === "fail");
+const errored = results.filter((r) => r.status === "error");
+
 if (failed.length > 0) {
   console.log("\n失败用例");
   for (const f of failed) {
     console.log(`  ${f.id}  「${f.input}」`);
     console.log(`     工具：${f.toolCalls.join(",") || "(纯文本)"} · 组件：${f.components.join(",") || "(无)"}`);
     for (const reason of f.reasons) console.log(`     · ${reason}`);
+  }
+}
+
+/**
+ * 异常单独一节，不混进「失败用例」。
+ *
+ * 这一节的输出长得和失败不一样是有意的：失败要回答「哪里没做对」，
+ * 异常要回答「哪个组件崩了、崩在哪一行」。看这两节的人，下一步动作也不同 ——
+ * 一个去改 prompt，一个去修代码。
+ */
+if (errored.length > 0) {
+  console.log("\n执行异常（不是质量失败 —— 这些是评测自身没跑起来）");
+  for (const f of errored) {
+    console.log(`  ! ${f.id}  「${f.input}」`);
+    console.log(`     ${f.error}`);
   }
 }
 
@@ -397,6 +511,8 @@ interface Gate {
   target: number;
   atMost?: boolean;
   note?: string;
+  /** 展示单位。缺省百分比；异常那条报的是条数 */
+  unit?: "count";
 }
 
 const measured = results.filter((r) => r.metrics.intentExpected !== null);
@@ -439,6 +555,31 @@ const gates: Gate[] = [
     note: `闸3，${allEnvelopes.length} 个信封`,
   },
   { name: "降级比例", value: pct(degraded, wantComponent.length), target: 5, atMost: true, note: `${wantComponent.length} 条想组件` },
+  // 下面两条不是第四阶段那张表里的，是这个仓库自己加的。
+  // 加它们的理由：上面五条全是「某一层的某件事做对没有」，
+  // 少了「整体有没有退步」和「这次评测本身可信不可信」两个方向。
+  {
+    name: "加权得分",
+    value: report.weightedScore * 100,
+    target: 95,
+    note: "按层严重度加权，对抗层挂了掉分最多",
+  },
+  {
+    name: "执行异常",
+    // 门槛是 0，不是「低于 2%」。
+    //
+    // 有些评测框架给异常率留一个百分比容忍度，理由是真实的模型调用会有网络抖动。
+    // 那在每天跑一万条的生产评测里是对的，在这个仓库里是错的：
+    // 默认的 mock 是**确定性**的，同一个输入永远给同一个输出 ——
+    // 它上面出现异常，100% 是代码 bug，不存在「抖动」这个解释。
+    // 而一条异常用例意味着这次评测**少了一个结论**，上面所有比率的分母都是缺的。
+    // 少测了一条还能算通过，这个口子一开，就再也关不上了。
+    value: report.errored,
+    target: 0,
+    atMost: true,
+    unit: "count",
+    note: "任何一条异常都让本次结论不完整",
+  },
 ];
 
 const miss = (g: Gate) =>
@@ -467,10 +608,12 @@ for (const r of withExpectedComponent) {
 console.log("\n上线门槛（离线可测的部分）");
 const pad2 = (s: string, n: number) => s + " ".repeat(Math.max(0, n - [...s].reduce((w, ch) => w + (/[一-龥]/.test(ch) ? 2 : 1), 0)));
 for (const g of gates) {
-  const shown = g.value === null ? "—" : `${g.value.toFixed(1)}%`;
+  const isCount = g.unit === "count";
+  const suffix = isCount ? "条" : "%";
+  const shown = g.value === null ? "—" : `${isCount ? g.value : g.value.toFixed(1)}${suffix}`;
   const dir = g.atMost ? "≤" : "≥";
   console.log(
-    `  ${miss(g) ? "✗" : "✓"} ${pad2(g.name, 16)}${shown.padStart(7)}   ${dir}${String(g.target).padStart(5)}%   ${g.note ?? ""}`,
+    `  ${miss(g) ? "✗" : "✓"} ${pad2(g.name, 16)}${shown.padStart(7)}   ${dir}${String(g.target).padStart(5)}${suffix}   ${g.note ?? ""}`,
   );
 }
 
@@ -488,15 +631,18 @@ console.log(`
 
 /* ---------- 存档与回归对比 ---------- */
 
-const record = buildRecord({
-  provider,
-  goldenVersion: golden.version,
-  layers: layers.map((layer) => {
-    const rows = results.filter((r) => r.layer === layer);
-    return { layer, ok: rows.filter((r) => r.ok).length, total: rows.length };
-  }),
-  failures: failed.map((f) => ({ id: f.id, input: f.input, reasons: f.reasons })),
-});
+// 门槛的结论写回报告，随存档一起落盘 ——
+// 否则「这次没达标」这件事只活在终端的那一屏里，翻存档时看不见
+report.gatePassed = gates.filter(miss).length === 0;
+report.gateReasons = gates
+  .filter(miss)
+  .map((g) => {
+    const suffix = g.unit === "count" ? "条" : "%";
+    const shown = g.value === null ? "未测" : `${g.unit === "count" ? g.value : g.value.toFixed(1)}${suffix}`;
+    return `${g.name} ${shown} ${g.atMost ? ">" : "<"} ${g.target}${suffix}`;
+  });
+
+const record = buildRecord(report, { quarantined: quarantined.length });
 
 // 先读上一次再写本次，否则会拿自己跟自己比
 const previous = listRuns()[0] ?? null;
@@ -513,14 +659,27 @@ if (!cmp.previous) {
 } else {
   const prev = cmp.previous;
   console.log(`  基线 ${prev.runId} · ${prev.provider} · ${prev.gitCommit ?? "无 commit"}`);
-  if (!cmp.sameGolden) {
-    console.log(
-      `  ⚠ 用例集版本变了（v${prev.goldenVersion} → v${golden.version}），总数变化里混着用例增减，逐条对比才可信`,
-    );
-  }
+  // 这一行是整个「对比」环节的前提：变的是考卷还是答题的。
+  // 不写出来，下面所有数字都可以被两种完全相反的原因解释
+  console.log(
+    cmp.sameGolden
+      ? `  用例集 ${record.datasetHash} 未变 —— 下面的差异都是代码/模型造成的`
+      : `  ⚠ 用例集内容变了（${prev.datasetHash} → ${record.datasetHash}）：差异里混着用例增减，逐条对比才可信`,
+  );
+  const scoreArrow = cmp.scoreDelta > 0 ? "↑" : cmp.scoreDelta < 0 ? "↓" : "=";
+  console.log(
+    `  加权得分 ${(prev.weightedScore * 100).toFixed(1)}% → ${(record.weightedScore * 100).toFixed(1)}%  ${scoreArrow}${cmp.scoreDelta === 0 ? "" : `${Math.abs(cmp.scoreDelta).toFixed(1)}pp`}`,
+  );
   for (const l of cmp.layerDeltas) {
     const arrow = l.delta > 0 ? "↑" : l.delta < 0 ? "↓" : "=";
     console.log(`  ${pad(l.layer, 10)}${l.from.padEnd(7)}→ ${l.to.padEnd(7)}${arrow}${l.delta === 0 ? "" : Math.abs(l.delta)}`);
+  }
+  if (cmp.newErrors.length > 0) {
+    console.log(`\n  ⚠ 新出现执行异常 ${cmp.newErrors.length} 条 —— 先看这个，异常会让上面的比率虚高：`);
+    for (const e of cmp.newErrors) console.log(`      ${e.id}  ${e.error}`);
+  }
+  if (cmp.recovered.length > 0) {
+    console.log(`  · 异常恢复 ${cmp.recovered.length} 条：${cmp.recovered.map((e) => e.id).join(", ")}`);
   }
   if (cmp.regressed.length > 0) {
     console.log(`\n  ✗ 回归 ${cmp.regressed.length} 条（上次通过、这次失败）：`);
@@ -532,6 +691,26 @@ if (!cmp.previous) {
   if (cmp.regressed.length === 0 && cmp.fixed.length === 0 && cmp.totalDelta === 0) {
     console.log("  逐条结果与上次一致");
   }
+}
+
+/**
+ * 隔离区：跑了但不计分的那批。
+ *
+ * 单独一节、明确的「不计分」字样，是为了防止一个很自然但很危险的读法：
+ * 看到「候选区 3 条全过」就以为可以把它当成成绩。它现在的身份是**待评审**，
+ * 评审通过了（把 review_status 改成 approved）它才会进入上面的数字。
+ */
+if (withCandidates && candidateResults.length > 0) {
+  console.log(`\n隔离区（未评审，不计分 · ${candidateResults.length} 条）`);
+  for (const c of candidateResults) {
+    const mark = c.status === "pass" ? "通过" : c.status === "error" ? "异常" : "未通过";
+    console.log(`  ${mark.padEnd(4)}${c.id}  「${c.input}」${c.error ? `  ${c.error}` : ""}`);
+  }
+  console.log("  评审通过后把 review_status 改成 approved，这些用例才会进分数。");
+} else if (quarantined.length > 0 && !withCandidates) {
+  console.log(
+    `\n隔离区 ${quarantined.length} 条未跑：${quarantined.map((c) => c.id).join(", ")}\n  线上回流回来的用例，人工评审前不计分（--candidates 可以跑一遍看看）。`,
+  );
 }
 
 console.log(
@@ -549,5 +728,9 @@ console.log(
 // 一个防「慢慢退步」，一个防「一直就不够好」—— 两个都得有。
 const gateMissed = gates.filter(miss).length;
 
-// 本次有失败、或有回归（严格模式）、或门槛没达标，都算没通过
+// 三种没通过：有用例失败、门槛没达标、严格模式下出现回归。
+//
+// 执行异常不需要单独写在这里 —— 「执行异常 ≤ 0 条」本身就在门槛表里，
+// 走的是同一条判定路径。两处各写一遍的话，改了一处忘了另一处，
+// 就会出现「门槛显示 ✗ 但退出码是 0」这种最伤信任的状态。
 process.exit(failed.length > 0 || gateMissed > 0 || (strict && cmp.regressed.length > 0) ? 1 : 0);

@@ -22,7 +22,12 @@ dist/
 /data/
 
 # 评测产物
+#
+# index.jsonl 也要忽略：它是追加式的趋势日志，每跑一次评测就长一行。
+# 一个只增不减的文件进版本控制，会让每次 CI 都产生一个「改了但没意义的」diff ——
+# 而 baseline 靠 actions/cache 在 CI 轮次之间传递，本来就不需要提交进来。
 eval-runs/*.json
+eval-runs/*.jsonl
 eval-runs/*.md
 !eval-runs/.gitkeep
 

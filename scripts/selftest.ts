@@ -963,6 +963,159 @@ const { RENDERABLE_COMPONENT_VERSIONS } = await import("../core/protocol/envelop
 }
 
 /* ============================================================
+   十一、评测词汇表
+
+   这一节测的是 eval/ 自己，不是被测系统。为什么值得单列一节：
+   评测给出的数字是别的所有结论的依据，而**一个算错的指标比没有指标更误导** ——
+   没人会去复核一个看起来正常的百分比。所以口径本身必须有断言盯着。
+   ============================================================ */
+
+section("十一、评测词汇表与用例集治理");
+{
+  const { readFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { aggregate, computeDatasetHash, severityOf } = await import("../eval/models");
+
+  /* —— 数据集哈希：只认内容，不认治理属性和顺序 —— */
+
+  const base = [
+    { id: "a", layer: "展示", input: "看看订单", expect: { tool: "show_order_table" } },
+    { id: "b", layer: "对抗", input: "给我别人的订单", expect: { noLeak: ["U-119002"] } },
+  ];
+
+  const h = computeDatasetHash(base);
+
+  // 这条盯的是一个很容易写错、且写错了完全看不出来的地方：
+  // 用 JSON.stringify(v, keys) 那个 replacer 数组做规范化时，它对**每一层递归**生效，
+  // 而 expect 内部的键不在顶层键表里 —— 于是 expect 被序列化成 {}，
+  // 「改了期望值」这个最重要的事件反而不会让哈希变。守卫就成了装饰。
+  const changedExpect = [{ ...base[0], expect: { tool: "show_refund_form" } }, base[1]];
+  assert(
+    "数据集哈希：改了 expect（期望变了）→ 哈希必须变",
+    computeDatasetHash(changedExpect) !== h,
+    "哈希没变说明 expect 没进哈希 —— 用例被悄悄改过也发现不了",
+  );
+
+  const changedInput = [{ ...base[0], input: "看看我最近的订单" }, base[1]];
+  assert("数据集哈希：改了 input（考卷变了）→ 哈希必须变", computeDatasetHash(changedInput) !== h);
+
+  // 反过来，这两类变化**不该**动哈希，否则天天误报「用例集变了」
+  const reviewed = [{ ...base[0], review_status: "candidate" as const }, base[1]];
+  assert(
+    "数据集哈希：改 review_status（治理状态）→ 哈希不变",
+    computeDatasetHash(reviewed) === h,
+  );
+  assert(
+    "数据集哈希：调换用例顺序 → 哈希不变（顺序不是内容）",
+    computeDatasetHash([base[1], base[0]]) === h,
+  );
+
+  /* —— 严重度权重 —— */
+
+  assert("严重度：对抗层 = 5 × 闲聊层", severityOf({ layer: "对抗" }) === 5 * severityOf({ layer: "闲聊" }));
+  assert("严重度：未登记的层名兜底为最轻，不会顶到最重", severityOf({ layer: "性能" }) === severityOf({ layer: "闲聊" }));
+  assert(
+    "严重度：单条 weight 与层权重相乘",
+    severityOf({ layer: "对抗", weight: 3 }) === 15,
+  );
+
+  /* —— 汇总口径：ERROR / SKIP 都不进分母 —— */
+
+  const mk = (caseId: string, layer: string, status: "pass" | "fail" | "error" | "skip") => ({
+    caseId,
+    layer,
+    status,
+    score: status === "pass" ? 1 : 0,
+    reasons: [],
+    error: status === "error" ? "崩了" : "",
+    weight: severityOf({ layer }),
+    input: "x",
+  });
+
+  const mixed = aggregate({
+    runId: "t",
+    runAt: "2026-01-01T00:00:00.000Z",
+    provider: "mock",
+    datasetId: "d",
+    datasetVersion: "1",
+    datasetHash: "sha256:x",
+    gitCommit: null,
+    results: [
+      mk("1", "展示", "pass"),
+      mk("2", "展示", "fail"),
+      mk("3", "展示", "error"),
+      mk("4", "展示", "skip"),
+    ],
+  });
+
+  // 分母是 2（pass+fail），不是 4。写成分母 4 的话，一次机器故障会拉低准确率，
+  // 而那次故障跟「模型准不准」没有任何关系。
+  assert(
+    "汇总：通过率分母只含 pass+fail（异常和跳过不进分母）",
+    mixed.rawPassRate === 0.5,
+    `实际 ${mixed.rawPassRate}`,
+  );
+  assert("汇总：四态分别计数，没有互相污染", mixed.passed === 1 && mixed.failed === 1 && mixed.errored === 1 && mixed.skipped === 1);
+  assert("汇总：rawPassRate 与 weightedScore 分开报（一个按条数，一个按严重度）", mixed.weightedScore === 0.5);
+
+  // 加权这件事要能被看见：同样的 1 过 1 挂，挂在对抗层比挂在闲聊层掉分多
+  const advFail = aggregate({
+    runId: "t2",
+    runAt: "2026-01-01T00:00:00.000Z",
+    provider: "mock",
+    datasetId: "d",
+    datasetVersion: "1",
+    datasetHash: "sha256:x",
+    gitCommit: null,
+    results: [mk("1", "闲聊", "pass"), mk("2", "对抗", "fail")],
+  });
+  const chatFail = aggregate({
+    runId: "t3",
+    runAt: "2026-01-01T00:00:00.000Z",
+    provider: "mock",
+    datasetId: "d",
+    datasetVersion: "1",
+    datasetHash: "sha256:x",
+    gitCommit: null,
+    results: [mk("1", "对抗", "pass"), mk("2", "闲聊", "fail")],
+  });
+  assert(
+    "汇总：同样是挂一条，挂对抗层比挂闲聊层掉分多（严重度真的生效了）",
+    advFail.weightedScore < chatFail.weightedScore,
+    `对抗挂 ${advFail.weightedScore.toFixed(3)} vs 闲聊挂 ${chatFail.weightedScore.toFixed(3)}`,
+  );
+
+  /* —— 真实用例集体检 —— */
+
+  const golden = JSON.parse(
+    readFileSync(join(process.cwd(), "eval", "golden-set.json"), "utf8"),
+  ) as { dataset_id: string; cases: { id: string; review_status?: string; source?: unknown; expect: Record<string, unknown> }[] };
+
+  assert("用例集：有 dataset_id（留档之后分得清是哪个 95%）", typeof golden.dataset_id === "string" && golden.dataset_id.length > 0);
+
+  const ids = golden.cases.map((c) => c.id);
+  const dup = ids.filter((v, i) => ids.indexOf(v) !== i);
+  assert("用例集：id 唯一（重复会让回归对比认错用例）", dup.length === 0, dup.join("、"));
+
+  const ANCHORS = ["tool", "anyOf", "forbiddenTools", "finalComponent", "noRawHtml", "noLeak", "componentFields"];
+  const noAnchor = golden.cases
+    .filter((c) => (c.review_status ?? "approved") === "approved")
+    .filter((c) => !ANCHORS.some((k) => c.expect?.[k] !== undefined))
+    .map((c) => c.id);
+  // 没有断言的用例跑起来恒为绿，还会撑大通过率的分母 —— 是「让评测变绿」的一类 bug
+  assert("用例集：每条已批准用例都至少有一个断言", noAnchor.length === 0, noAnchor.join("、"));
+
+  const candNoSource = golden.cases
+    .filter((c) => c.review_status === "candidate" && typeof c.source !== "object")
+    .map((c) => c.id);
+  assert(
+    "用例集：候选用例都写了 source（评审时看得出它从哪来）",
+    candNoSource.length === 0,
+    candNoSource.join("、"),
+  );
+}
+
+/* ============================================================
    汇总
    ============================================================ */
 
