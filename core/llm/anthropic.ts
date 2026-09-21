@@ -102,6 +102,14 @@ export const anthropicAdapter: LLMAdapter = {
         input: (b.input ?? {}) as Record<string, unknown>,
       }));
 
-    return { text, toolCalls };
+    return {
+      text,
+      toolCalls,
+      // 记账用的原始数字，不在这里换算成钱 —— 见 core/runtime/cost.ts 的说明
+      usage: {
+        inputTokens: message.usage?.input_tokens ?? 0,
+        outputTokens: message.usage?.output_tokens ?? 0,
+      },
+    };
   },
 };

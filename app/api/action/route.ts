@@ -34,6 +34,7 @@ import {
 } from "@/core/data/session";
 import { gate2CheckToolInput } from "@/core/guardrails/gates";
 import { dispatchToolCalls, streamText } from "@/core/gateway/dispatch";
+import { rateLimitResponse, withTurnSlot } from "@/core/gateway/guard";
 import { sseResponse } from "@/core/gateway/sse";
 import type { LLMToolCall } from "@/core/llm/adapter";
 import { isTextOnlyForced } from "@/core/llm";
@@ -69,7 +70,13 @@ export async function POST(request: Request): Promise<Response> {
   const userId = resolveUserId(request);
   const sessionId = resolveSessionId(request, body);
 
-  return sseResponse(correlationId, async (emit) => {
+  // 和 chat 走同一套闸。按钮这条路会真的产生副作用（submitRefund），
+  // 更不能是那个「少校验了一次」的入口。
+  const limited = rateLimitResponse(sessionId, correlationId);
+  if (limited) return limited;
+
+  return sseResponse(correlationId, (emit) =>
+    withTurnSlot(emit, correlationId, async () => {
     const trace = new TraceBuilder(correlationId);
     const session = getOrCreateSession(sessionId, userId);
     const textOnly = isTextOnlyForced();
@@ -142,7 +149,8 @@ export async function POST(request: Request): Promise<Response> {
       gates: finished.gates,
       totalMs: finished.totalMs,
     });
-  });
+    }),
+  );
 }
 
 /* ============================================================

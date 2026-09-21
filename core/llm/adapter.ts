@@ -37,6 +37,12 @@ export interface LLMDecision {
   /** 面向用户的文本。只调工具时可以是一句过渡语，也可以为空 */
   text: string;
   toolCalls: LLMToolCall[];
+  /**
+   * 本轮消耗的 token。可选项，因为不是所有适配器都报得出来 ——
+   * mock 就没有这个数（它不花任何钱，报一个编出来的数只会污染成本看板）。
+   * 缺失时按 0 记账，宁可少记也不要记一个假的。
+   */
+  usage?: { inputTokens: number; outputTokens: number };
 }
 
 export interface LLMHandlers {

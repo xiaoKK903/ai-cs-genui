@@ -487,6 +487,237 @@ async function runTurn(text: string, sessionId: string) {
 }
 
 /* ============================================================
+   八、运行时治理（超时 / 熔断 / 限流 / 预路由 / 成本 / SSE 保护）
+   ============================================================ */
+
+section("八、运行时治理");
+
+const { withTimeout, TimeoutError } = await import("../core/runtime/timeout");
+const { CircuitBreaker, CircuitOpenError, withBreaker } = await import("../core/runtime/breaker");
+const { ConcurrencyGate, KeyedRateLimiter, TokenBucket } = await import("../core/runtime/limiter");
+const { isPureGreeting, preroute } = await import("../core/runtime/router");
+const { CostLedger } = await import("../core/runtime/cost");
+const { sseResponse, sseStats, __resetSseStats } = await import("../core/gateway/sse");
+const { withTurnSlot, rateLimitResponse } = await import("../core/gateway/guard");
+const { __resetRuntime, turnGate } = await import("../core/runtime/index");
+
+/* ---------- 超时 ---------- */
+
+{
+  const fast = await withTimeout(async () => "ok", 1_000, "fast");
+  assert("超时：时间内返回原值", fast === "ok");
+
+  let timedOut = false;
+  try {
+    await withTimeout(() => new Promise((r) => setTimeout(r, 200)), 30, "slow");
+  } catch (err) {
+    timedOut = err instanceof TimeoutError;
+  }
+  assert("超时：超时后抛 TimeoutError", timedOut);
+
+  // ms<=0 表达的是「这条路径不设超时」，不是「立即超时」——
+  // 写反了会让演示模式下所有取数直接失败
+  const noLimit = await withTimeout(async () => "still ok", 0, "disabled");
+  assert("超时：ms<=0 表示不设超时而非立即超时", noLimit === "still ok");
+}
+
+/* ---------- 熔断 ---------- */
+
+{
+  let clock = 0;
+  const b = new CircuitBreaker("t", { threshold: 2, cooldownMs: 1_000, now: () => clock });
+
+  await withBreaker(b, async () => "1").catch(() => {});
+  await withBreaker(b, async () => { throw new Error("boom"); }).catch(() => {});
+  assert("熔断：失败一次还不跳闸", b.snapshot().state === "closed");
+
+  await withBreaker(b, async () => { throw new Error("boom"); }).catch(() => {});
+  assert("熔断：连续失败到阈值后跳闸", b.snapshot().state === "open");
+
+  let opened = false;
+  await withBreaker(b, async () => "never runs").catch((e) => {
+    opened = e instanceof CircuitOpenError;
+  });
+  assert("熔断：跳闸后快速失败，且请求根本没发出去", opened);
+  assert("熔断：被拒的那次不计入失败数（否则闸门焊死）", b.snapshot().consecutiveFailures === 2);
+
+  clock += 1_001;
+  await withBreaker(b, async () => "probe");
+  assert("熔断：冷却后探针成功即闭合", b.snapshot().state === "closed");
+  assert("熔断：闭合后失败数清零", b.snapshot().consecutiveFailures === 0);
+
+  // 半开只放一个探针：放开一批去试一个可能还没恢复的上游，等于把故障重演一遍
+  clock += 10_000;
+  const b2 = new CircuitBreaker("t2", { threshold: 1, cooldownMs: 100, now: () => clock });
+  await withBreaker(b2, async () => { throw new Error("x"); }).catch(() => {});
+  clock += 200;
+  assert("熔断：半开状态对外如实上报", b2.snapshot().state === "halfOpen");
+  assert("熔断：半开只放第一个探针", b2.allow() === true && b2.allow() === false);
+}
+
+/* ---------- 限流 ---------- */
+
+{
+  let clock = 0;
+  const bucket = new TokenBucket(3, 1, () => clock);
+  assert("限流：容量内连续放行", bucket.tryAcquire() && bucket.tryAcquire() && bucket.tryAcquire());
+  assert("限流：超过容量被拒", !bucket.tryAcquire());
+  clock += 2_000;
+  assert("限流：随时间补充令牌", bucket.tryAcquire());
+
+  const rl = new KeyedRateLimiter(2, 0.01);
+  rl.tryAcquire("a");
+  rl.tryAcquire("a");
+  assert("限流：按 key 独立计数", !rl.tryAcquire("a") && rl.tryAcquire("b"));
+  rl.forget("a");
+  assert("限流：forget 之后桶重建（防 Map 无限增长）", rl.tryAcquire("a"));
+
+  const gate = new ConcurrencyGate(2);
+  assert("并发闸：限额内可进入", gate.tryEnter() && gate.tryEnter());
+  assert("并发闸：超限被拒", !gate.tryEnter());
+  gate.leave();
+  assert("并发闸：释放后可再进", gate.tryEnter());
+  assert("并发闸：峰值被记录下来", gate.snapshot().peak === 2);
+}
+
+/* ---------- 预路由 ---------- */
+
+{
+  for (const t of ["你好", "在吗", "HI", "hello", "你好呀！", "在不在？", "  你好  ", "客服"]) {
+    assert(`预路由命中「${t}」`, isPureGreeting(t));
+  }
+  // 这一组是防止「按长度/像寒暄」这类启发式写宽的护栏。
+  // 「退款」和「在吗」一样是两个字 —— 长度最不该用来做这个判断。
+  for (const t of ["退款", "在吗我要退款", "查订单", "订单", "退货运费谁承担", "", "。。。", "帮我"]) {
+    assert(`预路由不误伤「${t || "(空)"}」`, !isPureGreeting(t));
+  }
+  assert("预路由：命中返回固定话术", preroute("你好")?.reply.length! > 0);
+  assert("预路由：未命中返回 null", preroute("我要退款") === null);
+}
+
+/* ---------- 成本记账 ---------- */
+
+{
+  const ledger = new CostLedger();
+  ledger.record("s1", { inputTokens: 100, outputTokens: 20 });
+  ledger.record("s1", { inputTokens: 50, outputTokens: 10 });
+  ledger.record("s2", { inputTokens: 5, outputTokens: 1 });
+  ledger.recordSaved("s1");
+
+  const s1 = ledger.snapshot("s1");
+  assert("成本：按会话累计 token", s1.inputTokens === 150 && s1.outputTokens === 30);
+  assert("成本：调用次数一并记下", s1.calls === 2);
+  assert("成本：预路由省下的次数单独记", s1.savedCalls === 1);
+  assert("成本：未记账的会话返回零值而不是 undefined", ledger.snapshot("nope").calls === 0);
+  assert("成本：全局合计不混会话", ledger.total().inputTokens === 155 && ledger.total().sessions === 2);
+  assert("成本：预算触顶判定", ledger.overBudget("s1", 2) && !ledger.overBudget("s1", 3));
+}
+
+/* ---------- H2：取数超时降级为文本 ---------- */
+
+{
+  resetData();
+  process.env.TOOL_TIMEOUT_MS = "40";
+  process.env.MOCK_TOOL_DELAY_MS = "300";
+  try {
+    const { events, result } = await runTurn("看下我最近的订单", "s_timeout_1");
+    assert("取数超时：不产出组件", !events.some((e) => e.event === "component"));
+    assert("取数超时：记为降级", result.degraded);
+    assert("取数超时：给出可重试的话而不是报错", result.texts.some((t) => t.includes("再问我一次")));
+    assert(
+      "取数超时：工具状态被收掉，不留转圈的标签",
+      events.some((e) => e.event === "tool_status" && e.data.status === "done"),
+    );
+  } finally {
+    process.env.TOOL_TIMEOUT_MS = "5000";
+    process.env.MOCK_TOOL_DELAY_MS = "0";
+  }
+}
+
+/* ---------- H1：SSE 心跳与连接数保护 ---------- */
+
+/** 把一条 SSE 流读到结束，返回原始帧文本 */
+async function drainSSE(res: Response, timeoutMs: number): Promise<string> {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  const timer = setTimeout(() => void reader.cancel().catch(() => {}), timeoutMs);
+  let out = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      out += decoder.decode(value, { stream: true });
+    }
+  } catch {
+    // 被 cancel 打断，已读到的部分照样返回
+  }
+  clearTimeout(timer);
+  return out;
+}
+
+{
+  __resetSseStats();
+  process.env.SSE_HEARTBEAT_MS = "10";
+  process.env.MAX_SSE_CONNECTIONS = "64";
+
+  const res = sseResponse("c_beat", async (emit) => {
+    await new Promise((r) => setTimeout(r, 60));
+    emit.send("done", { correlationId: "c_beat" });
+  });
+  const text = await drainSSE(res, 2_000);
+
+  assert("心跳：以注释帧下发（客户端无需为它加分支）", text.includes(": keepalive"));
+  assert("心跳：不影响正常事件", text.includes("event: done"));
+  assert("SSE：流结束后连接数回落", sseStats().active === 0);
+
+  // 连接数上限：拒绝新连接，而不是踢掉正在看答案的老连接
+  __resetSseStats();
+  process.env.MAX_SSE_CONNECTIONS = "1";
+  const first = sseResponse("c_cap1", async () => {
+    await new Promise((r) => setTimeout(r, 120));
+  });
+  const second = sseResponse("c_cap2", async () => {});
+  assert("SSE：超出连接上限的新连接被拒", second.status === 503);
+  assert("SSE：被拒的连接明确告诉客户端等多久", second.headers.get("Retry-After") === "2");
+
+  await drainSSE(first, 2_000);
+  assert("SSE：老连接结束后上限重新可用", sseStats().active === 0);
+
+  process.env.MAX_SSE_CONNECTIONS = "128";
+  process.env.SSE_HEARTBEAT_MS = "15000";
+}
+
+/* ---------- 入口闸门 ---------- */
+
+{
+  __resetRuntime();
+
+  const freshLimiter = new KeyedRateLimiter(2, 0.01);
+  assert("限流器：容量内放行", freshLimiter.tryAcquire("k") && freshLimiter.tryAcquire("k"));
+  assert("限流器：超过容量被拦（429 的来源）", !freshLimiter.tryAcquire("k"));
+
+  // 这里刻意不去断言「第 N 次被拦」—— 全局限流器的容量来自环境变量，
+  // 写死一个次数等于把测试和某个具体配置绑在一起。一直发到被拦为止，
+  // 断言的才是「它确实会拦」这个性质本身。
+  let rejection: Response | null = null;
+  for (let i = 0; i < 200 && !rejection; i += 1) {
+    rejection = rateLimitResponse("k_guard_fresh", "cid_guard");
+  }
+  assert("入口闸：刷到上限后返回 429", rejection?.status === 429);
+  assert("入口闸：429 里带上重试等待时间", rejection?.headers.get("Retry-After") === "2");
+
+  // withTurnSlot 必须在异常路径上也释放槽位，否则几轮报错之后服务就「一直说忙」
+  const fakeEmit = { closed: false, send() {} };
+  const before = turnGate.snapshot().inFlight;
+  await withTurnSlot(fakeEmit as never, "cid_slot", async () => {
+    throw new Error("内部炸了");
+  }).catch(() => {});
+  assert("入口闸：轮次异常时槽位照常释放", turnGate.snapshot().inFlight === before);
+
+  __resetRuntime();
+}
+
+/* ============================================================
    汇总
    ============================================================ */
 

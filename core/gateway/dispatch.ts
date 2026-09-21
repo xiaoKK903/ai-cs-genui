@@ -13,6 +13,7 @@ import type { LLMToolCall } from "../llm/adapter";
 import { resolveProvider } from "../llm";
 import { newInstanceId } from "../protocol/envelope";
 import type { ComponentName } from "../protocol/types";
+import { TIMEOUTS, TimeoutError, withTimeout } from "../runtime";
 import { TOOL_COMPONENT_MAP } from "../tools/definitions";
 import { executeTool } from "../tools/execute";
 import type { TraceBuilder } from "../trace";
@@ -111,19 +112,47 @@ export async function dispatchToolCalls(
       ctx.emit.send("tool_status", { instanceId, status: "running", tool: call.name });
     }
 
-    const outcome = await ctx.trace.run(
-      `tool:${call.name}`,
-      async () => {
-        if (toolLatencyMs() > 0) await sleep(toolLatencyMs());
-        return executeTool(call.name, call.input, {
-          session: ctx.session,
-          correlationId: ctx.correlationId,
-          instanceId,
-        });
-      },
-      undefined,
-      [`tool:${call.name}`],
-    );
+    let outcome: Awaited<ReturnType<typeof executeTool>>;
+    try {
+      outcome = await ctx.trace.run(
+        `tool:${call.name}`,
+        async () =>
+          // 取数超时（H2）。
+          // 没有这一层的话，业务系统「慢」就等于这一轮永远不结束 ——
+          // 骨架屏一直转，用户既拿不到结果也得不到失败，只能刷新页面。
+          // 超时不是拒绝：数据可能根本没问题，只是这次没等回来，
+          // 所以文案是「再试一次」而不是「你无权/不存在」。
+          withTimeout(
+            async () => {
+              if (toolLatencyMs() > 0) await sleep(toolLatencyMs());
+              return executeTool(call.name, call.input, {
+                session: ctx.session,
+                correlationId: ctx.correlationId,
+                instanceId,
+              });
+            },
+            TIMEOUTS.tool,
+            `tool:${call.name}`,
+          ),
+        undefined,
+        [`tool:${call.name}`],
+      );
+    } catch (err) {
+      const label = err instanceof TimeoutError ? "取数超时" : "取数失败";
+      ctx.trace.note(label, err instanceof Error ? err.message : String(err));
+      ctx.trace.markDegraded(label);
+      result.degraded = true;
+
+      const text = "系统响应有点慢，这笔我暂时没查出来。稍后再问我一次？";
+      await streamText(ctx, text);
+      result.texts.push(text);
+      // 骨架屏交给前端在本轮结束时统一清理（见 Chat.tsx finishTurn），
+      // 这里只需要把工具状态收掉，免得那个「查询中」的标签一直转
+      if (!ctx.textOnly && component) {
+        ctx.emit.send("tool_status", { instanceId, status: "done", tool: call.name });
+      }
+      continue;
+    }
 
     if (outcome.kind === "refused") {
       // 越权/不存在：不进组件、不重试，如实告诉用户 —— 措辞里不含任何他人订单信息
