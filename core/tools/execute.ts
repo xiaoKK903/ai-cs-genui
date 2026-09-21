@@ -25,8 +25,8 @@ import {
   refundReasonStats,
   type Order,
   type RefundReason,
-} from "../data/mock-db";
-import { registerInstance, type ServerSession } from "../data/session";
+} from "../data/order-service";
+import { registerInstance, setLastOrderNo, type ServerSession } from "../data/session";
 import { makeEnvelope, newInstanceId } from "../protocol/envelope";
 import { ACTION_WHITELIST } from "../protocol/schema";
 import type { GenUIEnvelope, RowAction } from "../protocol/types";
@@ -189,7 +189,7 @@ function execShowOrderTable(input: ShowOrderTableInput, ctx: ToolContext): ToolO
   const envelope = emit(ctx, "OrderTable", props, "order-service.listOrders");
 
   // 只展示了一单时记下来，供「就退这个订单」这类指代消解
-  if (page.length === 1) ctx.session.lastOrderNo = page[0].id;
+  if (page.length === 1) setLastOrderNo(ctx.session, page[0].id);
 
   return {
     kind: "component",
@@ -276,7 +276,7 @@ function execShowRefundForm(input: ShowRefundFormInput, ctx: ToolContext): ToolO
   };
 
   const envelope = emit(ctx, "RefundForm", props, "order-service.findOrder");
-  ctx.session.lastOrderNo = order.id;
+  setLastOrderNo(ctx.session, order.id);
 
   return {
     kind: "component",

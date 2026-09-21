@@ -1,0 +1,60 @@
+# 持续集成
+#
+# 跑的是 `npm run check` —— 和本地一键验证完全同一条命令。
+# 这一点是刻意的：CI 里跑的必须是开发者本地也会跑的那条命令，
+# 否则会出现「本地过了 CI 挂」这种最消耗信任的失败。
+#
+# 四步各自回答一个不同的问题，缺一个都会有盲区：
+#   typecheck      —— 类型还自洽吗
+#   selftest       —— 代码还按设计工作吗（挂了就是 bug）
+#   check:persist  —— 幂等跨进程重启还算数吗（内存实现过不了这一步）
+#   regress        —— 模型选得还准吗，有没有改好一个、改坏三个
+#
+# 注意：eval 用的是 mock 适配器，不调真模型、不花钱、不需要密钥。
+# 这是「确定性 mock 默认」这条设计原则在 CI 上的兑现 —— 回归门槛不该依赖外部服务。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # node:sqlite 需要 22.5+，这里直接跟本地保持一致的次新版本
+          node-version: "24"
+          cache: npm
+
+      - run: npm ci
+
+      # 评测基线要跨 CI 轮次累积，否则每次都是「第一次跑」，--strict 抓不到回归。
+      # key 里带分支名：不同分支各留各的基线，合并时不会互相打架。
+      - name: 恢复评测基线
+        uses: actions/cache@v4
+        with:
+          path: eval-runs
+          key: eval-runs-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            eval-runs-${{ github.ref_name }}-
+            eval-runs-
+
+      - name: 一键验证
+        run: npm run check
+
+      # 失败时把评测存档一并留下，省得为了复现再跑一遍
+      - name: 上传评测存档
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-runs
+          path: eval-runs/
+          if-no-files-found: ignore
+          retention-days: 30

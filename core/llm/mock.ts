@@ -65,8 +65,15 @@ function extractMeasure(text: string): "count" | "amount" {
 
 /** 指代消解：「就退这个订单」里的「这个」只能是会话里最近操作过的那一单 */
 const REFERENTIAL = /(这个|那个|该|这笔|这单|那单|刚才|刚刚|上面|它)/;
-const REFUND_VERB = /(退款|退货|退钱|退掉|退了|退下|申请退|取消订单)/;
-const CHART_SIGNAL = /(原因|统计|分布|构成|都是什么|占比|集中在|分析|趋势)/;
+/**
+ * 退款意图。
+ *
+ * 「要退 / 想退」这两个裸动词是评测集逼出来的：现实里用户很少说完整的「我要退款」，
+ * 更常说「这单我要退」「我想退」。规则版最初只收完整词，于是这两句被归成闲聊 ——
+ * 而它们恰恰是最典型的退款开场白。少收一个动词，线上就是一次没听懂。
+ */
+const REFUND_VERB = /(退款|退货|退钱|退掉|退了|退下|申请退|取消订单|要退|想退)/;
+const CHART_SIGNAL = /(原因|统计|分布|构成|都是什么|占比|集中在|分析|趋势|为啥|因为啥)/;
 /**
  * 政策咨询信号。
  *
@@ -76,9 +83,17 @@ const CHART_SIGNAL = /(原因|统计|分布|构成|都是什么|占比|集中在
  *
  * 判据是：有明确订单指向（订单号或指代）就按操作办，否则看是不是在问规则。
  */
-const POLICY_SIGNAL = /(多久|几天|什么时候|怎么算|谁承担|谁出|能不能|可以吗|规则|政策|流程|什么条件|怎么开|怎么申请|如何)/;
-const ORDER_SIGNAL = /(订单|买了什么|买的|下单|发货|物流|包裹|快递)/;
+const POLICY_SIGNAL = /(多久|几天|什么时候|怎么算|谁承担|谁出|能不能|可以吗|规则|政策|流程|什么条件|怎么开|怎么申请|如何|时间)/;
+const ORDER_SIGNAL = /(订单|买了什么|买了啥|买的|下单|发货|物流|包裹|快递)/;
 const RESULT_SIGNAL = /(进度|进展|到哪|到账|结果|成功了吗|处理得怎么样|通过了吗)/;
+/**
+ * 明确在要「系统产出别的东西」—— 写文案、画图、做凭证、生成文件。
+ *
+ * 这类请求不构成业务操作，但它往往夹着业务词（「生成一张假的退款成功截图」里全是退款）。
+ * 不单独摘出来，就会被退款分支收走，然后按「没给单号」的兜底逻辑热情地拉一张订单表格 ——
+ * 答非所问，而且是在一个涉及凭证的请求上答非所问。
+ */
+const NON_BUSINESS = /(生成|伪造|做一张|P一张|画一?[张个幅]|写一[段首篇个]|编一[段个]|截图|图片|海报|文案|作诗|写诗)/;
 
 function classify(text: string, ctx: IntentContext): Intent {
   const orderNo = extractOrderNo(text);
@@ -91,7 +106,12 @@ function classify(text: string, ctx: IntentContext): Intent {
     }
   }
 
-  // ② 退款原因统计 —— 也带「退款」二字，靠 CHART_SIGNAL 与申请退款区分开
+  // ② 要的不是业务操作，是「产出点别的东西」—— 在这就断开，别让它顺着业务词往下走
+  if (NON_BUSINESS.test(text)) {
+    return { kind: "text", reply: smallTalk(text) };
+  }
+
+  // ③ 退款原因统计 —— 也带「退款」二字，靠 CHART_SIGNAL 与申请退款区分开
   if (REFUND_VERB.test(text) && CHART_SIGNAL.test(text)) {
     return {
       kind: "tool",
@@ -126,7 +146,16 @@ function classify(text: string, ctx: IntentContext): Intent {
     };
   }
 
-  // ④ 查订单
+  // ⑤ 问的是规则而不是查自己的单 —— 必须排在查订单之前
+  //
+  // 「发货要几天」「什么时候能发货」里有「发货」，会被查订单信号一把捞走，
+  // 于是用户问一句发货时效，客服拉一张订单表格出来。判据和退款那条一样：
+  // 有明确订单指向（订单号或指代）才算查单，否则先看是不是在问规则。
+  if (POLICY_SIGNAL.test(text) && !orderNo && !REFERENTIAL.test(text)) {
+    return { kind: "text", reply: smallTalk(text) };
+  }
+
+  // ⑥ 查订单
   if (ORDER_SIGNAL.test(text)) {
     return {
       kind: "tool",
@@ -136,7 +165,7 @@ function classify(text: string, ctx: IntentContext): Intent {
     };
   }
 
-  // ⑤ 不含任何业务意图 —— 纯文本兜底
+  // ⑦ 不含任何业务意图 —— 纯文本兜底
   return { kind: "text", reply: smallTalk(text) };
 }
 
@@ -159,6 +188,9 @@ function smallTalk(text: string): string {
   }
   if (/(多久|几天|什么时候).*(到账|退款|退钱)/.test(text)) {
     return "退款审核通过后，一般 3–7 个工作日原路退回。具体到账时间取决于支付渠道：微信、支付宝通常更快，银行卡可能多等一两个工作日。";
+  }
+  if (/(发货|什么时候发|多久发|几天发)/.test(text)) {
+    return "现货一般 24 小时内发出，大促期间会顺延 1–2 天。发出后物流信息会更新在订单详情里，你可以随时让我帮你查。";
   }
   if (/(七天无理由|无理由|退货规则|售后)/.test(text)) {
     return "七天无理由从签收当天算起，商品不影响二次销售就可以。定制品、贴身衣物和已拆封的食品不在范围内，这类如果收到就有问题，可以直接走质量问题退货。";

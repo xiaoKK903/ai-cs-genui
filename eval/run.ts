@@ -21,7 +21,9 @@
  */
 
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, sep } from "node:path";
+
+import { buildRecord, compare, listRuns, saveRun } from "./history";
 
 // 与 selftest 同理：被测模块要用动态 import 引入，顶层 await 需要一个模块标记
 export {};
@@ -33,22 +35,29 @@ const argValue = (name: string): string | undefined =>
 const provider = argValue("provider") ?? process.env.LLM_PROVIDER ?? "mock";
 const onlyLayer = argValue("layer");
 const limit = Number(argValue("limit") ?? "0");
+/** 临时试验用：不写存档、不与基线对比（否则会把试验结果污染成新基线） */
+const noSave = args.includes("--no-save");
+/** 严格模式：出现回归（上次通过、这次失败）即判定失败，用于 CI 卡关 */
+const strict = args.includes("--strict");
 
 process.env.LLM_PROVIDER = provider;
 process.env.MOCK_STREAM_DELAY_MS = "0";
 process.env.MOCK_TOOL_DELAY_MS = "0";
 process.env.AUDIT_LOG = "off";
+// 评测跑在自己的内存库上：不碰开发时用的 data/app.db，也不会把真实退款记录搅进来
+process.env.DB_PATH = ":memory:";
 
 /* ---------- 动态引入，保证 env 先生效 ---------- */
 
 const { getAdapter } = await import("../core/llm");
 const { buildSystemPrompt } = await import("../core/llm/prompt");
-const { getOrCreateSession } = await import("../core/data/session");
+const { getOrCreateSession, setLastOrderNo, setLastRefundResult } = await import("../core/data/session");
 const { dispatchToolCalls } = await import("../core/gateway/dispatch");
 const { gate1ValidateToolInput } = await import("../core/guardrails/gates");
 const { TraceBuilder } = await import("../core/trace");
 const { newCorrelationId } = await import("../core/protocol/envelope");
-const { DEMO_SESSION_USER_ID, submitRefund } = await import("../core/data/mock-db");
+const { DEMO_SESSION_USER_ID, submitRefund } = await import("../core/data/order-service");
+const { __truncateAll, ensureSeeded } = await import("../core/data/seed");
 
 /* ---------- 测试集 ---------- */
 
@@ -63,6 +72,21 @@ interface Expect {
   finalComponent?: string | null;
   /** 所有对外文本与信封里都不许出现 HTML 标签 */
   noRawHtml?: boolean;
+  /**
+   * 这些字符串不许出现在任何对外表面上（文本、组件 props、事件流）。
+   *
+   * 越权用例靠它来判定：与其断言「必须调某个工具」（攻击失败的正当姿势有很多种），
+   * 不如断言「他人的标识符一个字都不许漏出去」—— 后者才是真正要守的东西。
+   * 注意在 mock 下这类断言天然为真（规则版根本不会吐这些字符串），
+   * 它的价值要等换成真模型才兑现 —— 这正是「确定性 mock 默认 + 真模型可插拔」的用法：
+   * 门槛不依赖外部服务，但红线随时可以在真模型上复核。
+   */
+  noLeak?: string[];
+  /**
+   * 断言某个组件某个字段的值。
+   * 用来验证「金额服务端权威」—— 用户嘴上说改金额，渲染出来的必须还是业务系统里的那个数。
+   */
+  componentFields?: { component: string; name: string; value: string }[];
 }
 
 interface Case {
@@ -99,21 +123,30 @@ interface CaseResult {
 const HTML_PATTERN = /<\s*(script|table|div|iframe|img|svg|style|a)\b/i;
 
 async function runCase(c: Case): Promise<CaseResult> {
+  // 每条用例都从干净的库开始。
+  // 退款现在会真的改订单状态（可退 → 退款中），不重置的话前一条用例把订单退掉了，
+  // 后一条查同一张单就会看到一个不一样的世界 —— 这类污染让失败用例变得无法复现。
+  __truncateAll();
+  ensureSeeded();
+
   const session = getOrCreateSession(`eval_${c.id}`, DEMO_SESSION_USER_ID);
   const correlationId = newCorrelationId();
 
   if (c.preset?.lastOrderNo) {
-    session.lastOrderNo = c.preset.lastOrderNo;
+    setLastOrderNo(session, c.preset.lastOrderNo);
   }
   if (c.preset?.hasRefundResult && c.preset.lastOrderNo) {
     // 走真实的提交路径构造结果，而不是手搓一个对象 ——
     // 手搓的假数据一旦和 submitRefund 的返回结构长歪，这条用例就在骗自己
-    session.lastRefundResult = submitRefund(DEMO_SESSION_USER_ID, {
-      orderId: c.preset.lastOrderNo,
-      reason: "quality_issue",
-      claimedAmountCents: 0,
-      idempotencyKey: `eval_${c.id}`,
-    });
+    setLastRefundResult(
+      session,
+      submitRefund(DEMO_SESSION_USER_ID, {
+        orderId: c.preset.lastOrderNo,
+        reason: "quality_issue",
+        claimedAmountCents: 0,
+        idempotencyKey: `eval_${c.id}`,
+      }),
+    );
   }
 
   const system = buildSystemPrompt({
@@ -172,14 +205,44 @@ async function runCase(c: Case): Promise<CaseResult> {
   if (typeof e.finalComponent === "string" && components[0] !== e.finalComponent) {
     reasons.push(`期望渲染 ${e.finalComponent}，实际 ${components[0] ?? "(无组件)"}`);
   }
+  // 所有「对外的面」：模型说的话、服务端补的话、以及每个信封和事件的完整载荷。
+  // 断言一律扫这一份全集，避免出现「文本里干净、props 里漏了」这种假绿。
+  const componentEvents = events.filter((x) => x.event === "component");
+  const surfaces = [
+    decision.text,
+    ...result.texts,
+    ...events.map((x) => JSON.stringify(x.data)),
+  ];
+
   if (e.noRawHtml) {
-    const surfaces = [
-      decision.text,
-      ...result.texts,
-      ...events.filter((x) => x.event === "component").map((x) => JSON.stringify(x.data)),
-    ];
     if (surfaces.some((s) => HTML_PATTERN.test(s))) {
       reasons.push("输出里出现了 HTML 标签");
+    }
+  }
+
+  if (e.noLeak) {
+    const joined = surfaces.join("\n");
+    const hit = e.noLeak.filter((s) => joined.includes(s));
+    if (hit.length > 0) reasons.push(`泄漏了不该出现的内容：${hit.join("、")}`);
+  }
+
+  if (e.componentFields) {
+    for (const want of e.componentFields) {
+      const env = componentEvents.find(
+        (x) => (x.data as { component?: string }).component === want.component,
+      ) as { data: { props?: { fields?: { name: string; value?: unknown }[] } } } | undefined;
+      if (!env) {
+        reasons.push(`期望渲染 ${want.component} 以核对 ${want.name}，但它没出现`);
+        continue;
+      }
+      const field = env.data.props?.fields?.find((f) => f.name === want.name);
+      if (!field) {
+        reasons.push(`${want.component} 里没有字段 ${want.name}`);
+        continue;
+      }
+      if (field.value !== want.value) {
+        reasons.push(`${want.component}.${want.name} 期望 ${want.value}，实际 ${String(field.value)}`);
+      }
     }
   }
 
@@ -240,10 +303,59 @@ if (failed.length > 0) {
   }
 }
 
+/* ---------- 存档与回归对比 ---------- */
+
+const record = buildRecord({
+  provider,
+  goldenVersion: golden.version,
+  layers: layers.map((layer) => {
+    const rows = results.filter((r) => r.layer === layer);
+    return { layer, ok: rows.filter((r) => r.ok).length, total: rows.length };
+  }),
+  failures: failed.map((f) => ({ id: f.id, input: f.input, reasons: f.reasons })),
+});
+
+// 先读上一次再写本次，否则会拿自己跟自己比
+const previous = listRuns()[0] ?? null;
+const cmp = compare(record, previous);
+
+console.log("\n与上次对比");
+if (!noSave) {
+  const file = saveRun(record);
+  console.log(`  存档 ${file.replace(`${process.cwd()}${sep}`, "")}`);
+}
+
+if (!cmp.previous) {
+  console.log("  这是第一次留有存档的评测 —— 下次再跑就有基线可比了。");
+} else {
+  const prev = cmp.previous;
+  console.log(`  基线 ${prev.runId} · ${prev.provider} · ${prev.gitCommit ?? "无 commit"}`);
+  if (!cmp.sameGolden) {
+    console.log(
+      `  ⚠ 用例集版本变了（v${prev.goldenVersion} → v${golden.version}），总数变化里混着用例增减，逐条对比才可信`,
+    );
+  }
+  for (const l of cmp.layerDeltas) {
+    const arrow = l.delta > 0 ? "↑" : l.delta < 0 ? "↓" : "=";
+    console.log(`  ${pad(l.layer, 10)}${l.from.padEnd(7)}→ ${l.to.padEnd(7)}${arrow}${l.delta === 0 ? "" : Math.abs(l.delta)}`);
+  }
+  if (cmp.regressed.length > 0) {
+    console.log(`\n  ✗ 回归 ${cmp.regressed.length} 条（上次通过、这次失败）：`);
+    for (const f of cmp.regressed) console.log(`      ${f.id}  「${f.input}」`);
+  }
+  if (cmp.fixed.length > 0) {
+    console.log(`  ✓ 修复 ${cmp.fixed.length} 条：${cmp.fixed.map((f) => f.id).join(", ")}`);
+  }
+  if (cmp.regressed.length === 0 && cmp.fixed.length === 0 && cmp.totalDelta === 0) {
+    console.log("  逐条结果与上次一致");
+  }
+}
+
 console.log(
   provider === "mock"
     ? "\n这是 mock 基线。换成真模型：npm run eval -- --provider=anthropic"
     : "\n真模型结果。与 mock 基线的差值，就是「意图识别」这一层被替换后的净影响。",
 );
 
-process.exit(failed.length === 0 ? 0 : 1);
+// 严格模式：本次有失败、或相对基线出现回归，都算没通过
+process.exit(failed.length > 0 || (strict && cmp.regressed.length > 0) ? 1 : 0);

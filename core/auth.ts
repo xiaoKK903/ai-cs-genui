@@ -13,7 +13,9 @@
  * 调用方拿到的仍然是「一个字符串」，不需要知道它是怎么来的。
  */
 
-import { DEMO_SESSION_USER_ID } from "./data/mock-db";
+// 从 domain 而不是 order-service 引入：鉴权只需要「演示账号是谁」这个常量，
+// 不该因为 import 了它就把整个数据层（建库、种子）一起拉起来。
+import { DEMO_SESSION_USER_ID } from "./data/domain";
 
 const UID_COOKIE = "cs_uid";
 

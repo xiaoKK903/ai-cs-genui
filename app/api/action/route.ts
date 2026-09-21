@@ -18,16 +18,20 @@
  *      前端伪造一个看起来合理但从未注册的 action，会在第 ② 步被拒。
  *
  * 还有一条底线：**退款金额永远不从 params 读**。params 里带了也不看，
- * 金额一律以订单在业务系统里的值为准（见 core/data/mock-db.ts 的 submitRefund）。
+ * 金额一律以订单在业务系统里的值为准（见 core/data/order-service.ts 的 submitRefund）。
  */
 
 import { resolveSessionId, resolveUserId } from "@/core/auth";
+import { REFUND_REASON_BY_LABEL, type RefundReason } from "@/core/data/domain";
+import { submitRefund } from "@/core/data/order-service";
 import {
-  REFUND_REASON_BY_LABEL,
-  submitRefund,
-  type RefundReason,
-} from "@/core/data/mock-db";
-import { appendTurn, findInstance, getOrCreateSession, type ServerSession } from "@/core/data/session";
+  appendTurn,
+  findInstance,
+  getOrCreateSession,
+  setLastOrderNo,
+  setLastRefundResult,
+  type ServerSession,
+} from "@/core/data/session";
 import { gate2CheckToolInput } from "@/core/guardrails/gates";
 import { dispatchToolCalls, streamText } from "@/core/gateway/dispatch";
 import { sseResponse } from "@/core/gateway/sse";
@@ -180,16 +184,15 @@ async function runAction(
         trace.note("退款原因反查失败", `收到未知选项「${reasonLabel}」，按「其他」处理`);
       }
 
-      // —— 幂等第一层：业务不变量。一个订单只能有一笔在途退款，与前端传什么无关。
-      const existing = session.lastRefundResult;
-      if (existing && existing.orderId === orderNo && existing.status === "submitted") {
-        trace.note("幂等命中（订单维度）", `订单 ${orderNo} 已有退款单 ${existing.refundId}`);
-        session.lastRefundResult = { ...existing, deduplicated: true };
-        return { kind: "tool", calls: [call("show_result_card", { orderNo })] };
-      }
+      // —— 订单维度的幂等不在这里做了。
+      //
+      // 原来这里查的是会话内存里的 lastRefundResult：「一个订单只能有一笔在途退款」这条
+      // 业务不变量，被挂在了「会话」这个维度上 —— 换个浏览器、或者进程重启，它就不成立了。
+      // 现在订单维度与请求维度的幂等统一由 order-service 在数据库层负责：
+      // 前者查 refunds 表里的在途记录，后者靠那条只对成功单据生效的部分唯一索引。
 
-      // —— 幂等第二层：请求维度。键由服务端自己算，不信任前端传来的幂等键。
-      // 同一实例、同一订单、同一原因重复提交，拿到的是同一笔单据。
+      // —— 请求维度：键由服务端自己算，不信任前端传来的幂等键。
+      // 同一会话、同一订单、同一原因重复提交，拿到的是同一笔单据。
       const idempotencyKey = `act:${session.sessionId}:${orderNo}:${reason}`;
 
       const result = submitRefund(session.userId, {
@@ -207,8 +210,8 @@ async function runAction(
         [`refund-service.submitRefund`, `order:${orderNo}`],
       );
 
-      session.lastRefundResult = result;
-      session.lastOrderNo = orderNo;
+      setLastRefundResult(session, result);
+      setLastOrderNo(session, orderNo);
 
       return { kind: "tool", calls: [call("show_result_card", { orderNo })] };
     }

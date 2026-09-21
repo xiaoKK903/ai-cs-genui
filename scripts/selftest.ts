@@ -18,6 +18,8 @@ export {};
 process.env.MOCK_STREAM_DELAY_MS = "0";
 process.env.MOCK_TOOL_DELAY_MS = "0";
 process.env.AUDIT_LOG = "off";
+// 自测跑在自己的内存库上，不碰开发用的 data/app.db
+process.env.DB_PATH = ":memory:";
 
 /* ---------- 断言 ---------- */
 
@@ -50,8 +52,22 @@ const { gate1ValidateToolInput, gate2CheckEnvelope, gate2CheckToolInput, gate3Ch
 const { makeRegistry, SUPPORTED_COMPONENT_VERSIONS } = await import("../components/genui/supported");
 
 const frontendRegistryLite = makeRegistry(SUPPORTED_COMPONENT_VERSIONS);
-const db = await import("../core/data/mock-db");
-const { __resetSessions, getOrCreateSession } = await import("../core/data/session");
+const db = await import("../core/data/order-service");
+const { __truncateAll, ensureSeeded } = await import("../core/data/seed");
+const { __resetSessions, getOrCreateSession, setLastOrderNo, setLastRefundResult } = await import(
+  "../core/data/session"
+);
+
+/**
+ * 每个会写数据的断言块开始前，把库恢复成「刚种完」的状态。
+ *
+ * 退款现在会真的改订单状态（可退 → 退款中），块与块之间不清就会互相影响；
+ * 更糟的是这种影响会随执行顺序变化，让失败变得无法复现。
+ */
+function resetData(): void {
+  __truncateAll();
+  ensureSeeded();
+}
 const { executeTool } = await import("../core/tools/execute");
 const { dispatchToolCalls } = await import("../core/gateway/dispatch");
 const { TraceBuilder } = await import("../core/trace");
@@ -256,7 +272,7 @@ assert(
 assert("能区分「他人订单」用于审计", db.orderBelongsToAnotherUser("SO-20260901-2201"));
 
 {
-  db.__resetRefundStore();
+  resetData();
   const r = db.submitRefund(ME, {
     orderId: "SO-20260910-6620",
     reason: "quality_issue",
@@ -275,7 +291,7 @@ assert("能区分「他人订单」用于审计", db.orderBelongsToAnotherUser("
   assert("幂等键命中返回首次结果", again.deduplicated && again.refundId === r.refundId);
 }
 {
-  db.__resetRefundStore();
+  resetData();
   const r = db.submitRefund(ME, {
     orderId: "SO-20260903-1188", // refunding 状态，refundable=false
     reason: "quality_issue",
