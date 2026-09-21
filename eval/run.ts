@@ -540,5 +540,14 @@ console.log(
     : "\n真模型结果。与 mock 基线的差值，就是「意图识别」这一层被替换后的净影响。",
 );
 
-// 严格模式：本次有失败、或相对基线出现回归，都算没通过
-process.exit(failed.length > 0 || (strict && cmp.regressed.length > 0) ? 1 : 0);
+// 门槛没达标 = 没通过。
+//
+// 只报数不拦人的门槛，和一句写在文档里的建议没有区别 —— 区别只在于
+// 看板好看一点。所以这里让退出码说话：达标与否不看人有没有注意到那一行。
+//
+// 与 --strict 的关系：--strict 比的是**和上次**（回归），门槛比的是**和绝对线**。
+// 一个防「慢慢退步」，一个防「一直就不够好」—— 两个都得有。
+const gateMissed = gates.filter(miss).length;
+
+// 本次有失败、或有回归（严格模式）、或门槛没达标，都算没通过
+process.exit(failed.length > 0 || gateMissed > 0 || (strict && cmp.regressed.length > 0) ? 1 : 0);
