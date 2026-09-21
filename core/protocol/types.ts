@@ -109,6 +109,15 @@ export interface RefundReasonChartProps {
   data: { label: string; value: number; amountCents?: number }[];
   dimension: string;
   measure: string;
+  /**
+   * v2 新增（可选）。一句结论文案，例如「质量问题占了将近一半」。
+   *
+   * 选它当第一个 v2，是因为它同时满足两个条件：对老客户端是**纯增量**
+   * （不填就不渲染，v1 的页面不会因此变形），对新客户端有真实价值
+   * （图表本身说明了分布，但没人念出来）。
+   * 灰度期最怕的是「新版本让老包渲染出一片空白」，增量式的改动从设计上就避开了这件事。
+   */
+  highlight?: string;
 }
 
 export interface ResultCardProps {

@@ -718,6 +718,135 @@ async function drainSSE(res: Response, timeoutMs: number): Promise<string> {
 }
 
 /* ============================================================
+   九、灰度：分桶、版本共存与降级
+   ============================================================ */
+
+section("九、灰度与版本共存");
+
+const { bucketOf, parseRollout, pickComponentVersion } = await import("../core/runtime/rollout");
+const { RENDERABLE_COMPONENT_VERSIONS } = await import("../core/protocol/envelope");
+
+{
+  // 稳定性是灰度能被接受的最低要求：一个用户在一次对话里看到的行为必须一致。
+  // 抽签式的灰度（每次请求随机）会让同一个会话里 v1/v2 交替出现，
+  // 用户说不清哪里不对，只会觉得「这东西不太稳」。
+  const first = bucketOf("sess_abc", "salt");
+  assert("分桶：同一个键永远落在同一个桶", [1, 2, 3].every(() => bucketOf("sess_abc", "salt") === first));
+
+  const saltA = bucketOf("sess_abc", "a");
+  const saltB = bucketOf("sess_abc", "b");
+  assert("分桶：换 salt 会换一批人（多实验不重叠）", saltA !== saltB || saltA === bucketOf("sess_abc", "a"));
+
+  // 分布不该严重偏斜 —— 偏了会让 10% 的灰度实际放到 40%
+  let inBucket = 0;
+  for (let i = 0; i < 2_000; i += 1) {
+    if (bucketOf(`sess_${i}`, "RefundReasonChart@2") < 10) inBucket += 1;
+  }
+  const share = (inBucket / 2_000) * 100;
+  assert(`分桶：10% 阈值的实际落桶率接近 10%（实测 ${share.toFixed(1)}%）`, share > 6 && share < 14);
+}
+
+{
+  const plan = parseRollout("RefundReasonChart@2=10, OrderTable@1=100");
+  assert("解析：正常配置解析出两条规则", plan.rules.length === 2);
+  assert("解析：组件与百分比取到对", plan.rules[0].component === "RefundReasonChart" && plan.rules[0].percent === 10);
+
+  // 配置写错一个字符就让服务起不来，是把配置问题升级成可用性问题
+  const messy = parseRollout("乱七八糟, RefundReasonChart@2=999, , OrderTable@x=5");
+  assert("解析：非法片段被跳过而不是抛错", messy.rules.length === 1);
+  assert("解析：百分比被夹到 0–100", messy.rules[0].percent === 100);
+  assert("解析：原文保留下来以备审计", messy.raw.includes("乱七八糟"));
+
+  assert("选版：percent=0 永远走默认版本", pickComponentVersion("RefundReasonChart", "s", "1", parseRollout("RefundReasonChart@2=0")) === "1");
+  assert("选版：percent=100 永远走新版本", pickComponentVersion("RefundReasonChart", "s", "1", parseRollout("RefundReasonChart@2=100")) === "2");
+  assert("选版：没配的组件走默认版本（新代码要靠配才打开）", pickComponentVersion("OrderTable", "s", "1", parseRollout("RefundReasonChart@2=100")) === "1");
+  assert(
+    "选版：同一会话多次调用结果一致",
+    new Set(Array.from({ length: 5 }, () => pickComponentVersion("RefundReasonChart", "sess_x", "1", parseRollout("RefundReasonChart@2=50")))).size === 1,
+  );
+}
+
+{
+  assert("版本表：RefundReasonChart 同时登记了 v1 与 v2", RENDERABLE_COMPONENT_VERSIONS.RefundReasonChart.join(",") === "1,2");
+
+  // v2 独有的字段让 v1 的 schema 判死 —— 这正是「schema 必须按版本取」的理由。
+  // 反过来说：如果不按版本取，开灰度那一刻所有 v2 信封都会在闸2 被拦下，
+  // 表现是「开了灰度的用户反而什么都看不到」。
+  const v1Schema = (await import("../core/protocol/schema")).COMPONENT_VERSION_SCHEMAS.RefundReasonChart["1"];
+  const v2PreProps = {
+    chartType: "bar",
+    data: [{ label: "质量问题", value: 3 }],
+    dimension: "reason",
+    measure: "count",
+    highlight: "最主要的原因是「质量问题」，占 33%。",
+  };
+  assert("版本：带 highlight 的 props 过不了 v1 的 schema", validate(v1Schema, v2PreProps, "$.props").length > 0);
+
+  const v2Env = makeEnvelope({
+    component: "RefundReasonChart",
+    componentVersion: "2",
+    props: v2PreProps,
+    instanceId: newInstanceId("RefundReasonChart"),
+    correlationId: cid,
+    dataSource: "refund-service.reasonStats",
+  });
+  assert("版本：同样的 props 在 v2 下合法（闸2 通过）", gate2CheckEnvelope(v2Env).passed);
+  assert("版本：未知版本仍然被拦（v3 不存在）", !checkEnvelope({ ...v2Env, componentVersion: "3" }).ok);
+
+  // —— 灰度演练：服务端发 v2，两种前端各是什么反应
+  const oldBundle = makeRegistry(SUPPORTED_COMPONENT_VERSIONS); // 今天的线上包，只有 v1
+  const newBundle = makeRegistry({ ...SUPPORTED_COMPONENT_VERSIONS, RefundReasonChart: ["1", "2"] });
+
+  const onOld = gate3CheckEnvelope(v2Env, oldBundle);
+  assert("共存：老前端拿到 v2 被闸3 拦下", !onOld.passed);
+  assert("共存：拦下的理由是「版本没注册」，不是崩溃", !onOld.passed && onOld.reason.includes("未注册"));
+  assert("共存：新前端拿到同一个信封正常渲染", gate3CheckEnvelope(v2Env, newBundle).passed);
+  assert("共存：v1 信封在新前端上照样渲染（灰度期旧路径不能断）", gate3CheckEnvelope(
+    makeEnvelope({
+      component: "RefundReasonChart",
+      props: { chartType: "bar", data: [{ label: "质量问题", value: 3 }], dimension: "reason", measure: "count" },
+      instanceId: newInstanceId("RefundReasonChart"),
+      correlationId: cid,
+      dataSource: "refund-service.reasonStats",
+    }),
+    newBundle,
+  ).passed);
+}
+
+{
+  // 端到端：打开灰度（100%），走真实工具执行路径
+  resetData();
+  process.env.ROLLOUT = "RefundReasonChart@2=100";
+  try {
+    const out = executeTool(
+      "show_refund_reason_chart",
+      { timeRange: "last90d", dimension: "reason", measure: "count" },
+      ctxFor("s_rollout_on"),
+    );
+    assert("灰度端到端：开满后信封是 v2", out.kind === "component" && out.envelope.componentVersion === "2");
+    assert(
+      "灰度端到端：v2 带上了结论文案",
+      out.kind === "component" && typeof (out.envelope.props as { highlight?: unknown }).highlight === "string",
+    );
+    assert("灰度端到端：v2 信封过得了闸2", out.kind === "component" && gate2CheckEnvelope(out.envelope).passed);
+
+    process.env.ROLLOUT = "";
+    const off = executeTool(
+      "show_refund_reason_chart",
+      { timeRange: "last90d", dimension: "reason", measure: "count" },
+      ctxFor("s_rollout_off"),
+    );
+    assert("灰度端到端：关掉后回到 v1", off.kind === "component" && off.envelope.componentVersion === "1");
+    assert(
+      "灰度端到端：v1 信封里没有 v2 的字段（否则会在闸2 被自己的 schema 拦下）",
+      off.kind === "component" && !("highlight" in (off.envelope.props as Record<string, unknown>)),
+    );
+  } finally {
+    process.env.ROLLOUT = "";
+  }
+}
+
+/* ============================================================
    汇总
    ============================================================ */
 

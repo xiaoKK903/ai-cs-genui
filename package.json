@@ -16,6 +16,7 @@
     "check:persist": "tsx scripts/persistence-check.ts write && tsx scripts/persistence-check.ts verify",
     "eval": "tsx eval/run.ts",
     "regress": "tsx eval/run.ts --strict",
+    "bench": "tsx scripts/bench.ts",
     "check": "npm run typecheck && npm run selftest && npm run check:persist && npm run regress"
   },
   "dependencies": {

@@ -28,6 +28,7 @@ import {
 } from "../data/order-service";
 import { registerInstance, setLastOrderNo, type ServerSession } from "../data/session";
 import { makeEnvelope, newInstanceId } from "../protocol/envelope";
+import { pickComponentVersion } from "../runtime/rollout";
 import { ACTION_WHITELIST } from "../protocol/schema";
 import type { GenUIEnvelope, RowAction } from "../protocol/types";
 
@@ -122,6 +123,7 @@ function emit(
   component: Parameters<typeof newInstanceId>[0],
   props: Record<string, unknown>,
   dataSource: string,
+  componentVersion = "1",
 ): GenUIEnvelope {
   const instanceId = ctx.instanceId ?? newInstanceId(component);
   registerInstance(ctx.session, instanceId, component, ACTION_WHITELIST[component]);
@@ -131,7 +133,22 @@ function emit(
     instanceId,
     correlationId: ctx.correlationId,
     dataSource,
+    componentVersion,
   });
+}
+
+/**
+ * v2 的结论文案。
+ *
+ * 写在这里而不是交给模型生成：这句话是**从数据里算出来的**，不是创作出来的。
+ * 让模型去描述一张它没见过的图，是把它放到一个很容易说错话的位置上 ——
+ * 图里的数就是权威，念数这件事不该有第二次解释的机会。
+ */
+function reasonHighlight(stats: { items: { label: string; count: number }[]; total: number }): string {
+  const top = [...stats.items].sort((a, b) => b.count - a.count)[0];
+  if (!top || stats.total === 0) return "这段时间没有集中的退款原因。";
+  const share = Math.round((top.count / stats.total) * 100);
+  return `最主要的原因是「${top.label}」，占 ${share}%。`;
 }
 
 /* ============================================================
@@ -301,7 +318,11 @@ function execShowRefundReasonChart(input: ShowRefundReasonChartInput, ctx: ToolC
     return { kind: "text", text: `${RANGE_LABEL[range]}你还没有退款记录，暂时没有可以统计的内容。` };
   }
 
-  const props = {
+  // 灰度：这个会话该拿哪个版本。同一个会话永远算出同一个答案（见 runtime/rollout.ts）。
+  // 没开灰度时恒为 "1"，走的是和以前完全一样的那条路。
+  const version = pickComponentVersion("RefundReasonChart", ctx.session.sessionId, "1");
+
+  const props: Record<string, unknown> = {
     chartType: "bar" as const,
     data: stats.items.map((i) => ({
       label: i.label,
@@ -313,7 +334,15 @@ function execShowRefundReasonChart(input: ShowRefundReasonChartInput, ctx: ToolC
     measure,
   };
 
-  const envelope = emit(ctx, "RefundReasonChart", props, "refund-service.reasonStats");
+  // v2 独有的字段只在真正要发 v2 时才填。
+  // 反过来写（无论哪个版本都填上）会在灰度一开就出事：v1 的 schema 是
+  // additionalProperties:false，多一个 highlight 会让整个信封在闸2 被拦下，
+  // 表现为「没开灰度的用户反而看不到了」。
+  if (version === "2") {
+    props.highlight = reasonHighlight(stats);
+  }
+
+  const envelope = emit(ctx, "RefundReasonChart", props, "refund-service.reasonStats", version);
 
   const desc =
     measure === "amount"

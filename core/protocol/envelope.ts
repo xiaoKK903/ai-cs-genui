@@ -5,17 +5,20 @@
  * 两侧走同一份 schema 与同一段校验逻辑。
  */
 
-import { ACTION_WHITELIST, COMPONENT_SCHEMAS, isComponentName } from "./schema";
+import { ACTION_WHITELIST, COMPONENT_VERSION_SCHEMAS, isComponentName } from "./schema";
 import { SCHEMA_VERSION, type ComponentName, type GenUIEnvelope } from "./types";
 import { summarizeIssues, validate } from "./validate";
 
-/** 当前该组件可渲染的版本集合。v1/v2 并存时在这里列出，未知版本回退降级（R1）。 */
-export const RENDERABLE_COMPONENT_VERSIONS: Record<ComponentName, string[]> = {
-  OrderTable: ["1"],
-  RefundForm: ["1"],
-  RefundReasonChart: ["1"],
-  ResultCard: ["1"],
-};
+/**
+ * 每个组件可渲染的版本集合。
+ *
+ * 不再手写，直接从版本化的 schema 表里推出来 —— 「有 schema 的版本」和
+ * 「协议允许渲染的版本」如果分成两份手写清单维护，加 v2 时漏改一边，
+ * 表现是「服务端认为能发、发出去却被自己人拦下」，排查起来要绕一圈。
+ */
+export const RENDERABLE_COMPONENT_VERSIONS: Record<ComponentName, string[]> = Object.fromEntries(
+  Object.entries(COMPONENT_VERSION_SCHEMAS).map(([name, versions]) => [name, Object.keys(versions)]),
+) as Record<ComponentName, string[]>;
 
 export interface EnvelopeBuildInput {
   component: ComponentName;
@@ -82,7 +85,8 @@ export function checkEnvelope(raw: unknown): EnvelopeCheck {
 
   // 3) 单组件版本可渲染性（R1：未知版本回退降级，不原地炸）
   const version = String(e.componentVersion ?? "");
-  if (!RENDERABLE_COMPONENT_VERSIONS[component].includes(version)) {
+  const schema = COMPONENT_VERSION_SCHEMAS[component]?.[version];
+  if (!schema) {
     return { ok: false, reason: `组件版本不可渲染：${component}@${version}` };
   }
 
@@ -94,8 +98,10 @@ export function checkEnvelope(raw: unknown): EnvelopeCheck {
     return { ok: false, reason: "缺少 correlationId" };
   }
 
-  // 5) props 严格 Schema
-  const issues = validate(COMPONENT_SCHEMAS[component], e.props, "$.props");
+  // 5) props 严格 Schema —— 按信封自己声明的版本取。
+  // 这是版本共存能成立的关键一步：v2 的信封（带 highlight）拿 v1 的 schema 校验
+  // 会被 additionalProperties:false 判死，而它本该是合法的。
+  const issues = validate(schema, e.props, "$.props");
   if (issues.length > 0) {
     return { ok: false, reason: `props 未通过 Schema：${summarizeIssues(issues)}` };
   }

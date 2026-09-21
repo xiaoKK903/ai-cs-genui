@@ -14,7 +14,7 @@ import type { GenUIComponentProps } from "./util";
  * CSS 也能直接吃到 prefers-reduced-motion，图表库的动画得另外关。
  */
 export function RefundReasonChart({ props }: GenUIComponentProps<RefundReasonChartProps>) {
-  const { data, measure } = props;
+  const { data, measure, highlight } = props;
   const max = Math.max(...data.map((d) => d.value), 1);
   const total = data.reduce((s, d) => s + d.value, 0);
 
@@ -22,8 +22,14 @@ export function RefundReasonChart({ props }: GenUIComponentProps<RefundReasonCha
     <div className="genui">
       <div className="genui-head">
         <span>退款原因分布</span>
+        {/* v2 才有的字段。老包拿到的 props 里没有它，这段直接不渲染 ——
+            这就是「增量式升级」在组件这一侧的兑现：同一个组件文件同时服务两个版本，
+            不需要 if (version) 分支，因为差异本身是可选的 */}
+        {highlight ? <span className="tag neutral">主要原因</span> : null}
         <span className="tag neutral">{measure === "amount" ? "按金额" : "按笔数"}</span>
       </div>
+
+      {highlight ? <p style={{ margin: "0 0 8px", color: "var(--muted, #666)", fontSize: 13 }}>{highlight}</p> : null}
 
       <div className="genui-body">
         <div className="bars">

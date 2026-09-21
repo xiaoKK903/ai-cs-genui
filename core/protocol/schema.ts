@@ -53,7 +53,14 @@ const ACTION_ITEM: JsonSchema = {
    四个组件的 props Schema
    ============================================================ */
 
-export const COMPONENT_SCHEMAS: Record<ComponentName, JsonSchema> = {
+/**
+ * v1 契约。
+ *
+ * 名字从 COMPONENT_SCHEMAS 改成 V1_SCHEMAS 是为了把「组件」和「版本」这两件事
+ * 在代码里分开 —— 原来一个组件只有一份 schema，于是 componentVersion 字段
+ * 只是个装饰：闸2 校验 props 时根本不看它。灰度期要真正共存，schema 必须按版本取。
+ */
+const V1_SCHEMAS: Record<ComponentName, JsonSchema> = {
   OrderTable: {
     type: "object",
     additionalProperties: false,
@@ -190,6 +197,58 @@ export const ACTION_WHITELIST: Record<ComponentName, string[]> = {
 export const ACTION_HANDLERS = ["openRefundForm", "submitRefund", "queryOrderDetail", "queryRefundStatus"] as const;
 
 export type ActionHandler = (typeof ACTION_HANDLERS)[number];
+
+/* ============================================================
+   按版本索引的 props Schema
+   ============================================================ */
+
+/**
+ * RefundReasonChart@2 —— 与 v1 的唯一差别是多一个可选的 highlight。
+ *
+ * 增量式升级（只加字段、不改语义、不加必填）是灰度期唯一稳妥的改法：
+ * 老包拿到 v2 的信封会走闸3 降级，新包渲染出多出来的那一行，
+ * 两边都不会因为对方的存在而坏掉。
+ *
+ * 这里没有写成 `{...v1, properties: {...}}` 那种浅拷贝 —— 手写一遍虽然长，
+ * 但「v2 到底和 v1 差在哪」这件事在 diff 里一眼可见。
+ * 用展开运算符省下的那点体量，换来的是 review 时要去脑内做合并。
+ */
+const REFUND_REASON_CHART_V2: JsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["chartType", "data", "dimension", "measure"],
+  properties: {
+    chartType: { type: "string", enum: ["bar"] },
+    data: {
+      type: "array",
+      minItems: 1,
+      maxItems: 12,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["label", "value"],
+        properties: {
+          label: { type: "string", minLength: 1, maxLength: 24 },
+          value: { type: "number", minimum: 0 },
+          amountCents: { type: "number", minimum: 0 },
+        },
+      },
+    },
+    dimension: { type: "string", enum: ["reason"] },
+    measure: { type: "string", enum: ["count", "amount"] },
+    highlight: { type: "string", minLength: 1, maxLength: 60 },
+  },
+};
+
+export const COMPONENT_VERSION_SCHEMAS: Record<ComponentName, Record<string, JsonSchema>> = {
+  OrderTable: { "1": V1_SCHEMAS.OrderTable },
+  RefundForm: { "1": V1_SCHEMAS.RefundForm },
+  RefundReasonChart: { "1": V1_SCHEMAS.RefundReasonChart, "2": REFUND_REASON_CHART_V2 },
+  ResultCard: { "1": V1_SCHEMAS.ResultCard },
+};
+
+/** 每个组件的默认版本（v1）。给不关心版本的调用方用，例如工具定义的生成。 */
+export const COMPONENT_SCHEMAS: Record<ComponentName, JsonSchema> = V1_SCHEMAS;
 
 export const COMPONENT_NAMES = Object.keys(COMPONENT_SCHEMAS) as ComponentName[];
 
