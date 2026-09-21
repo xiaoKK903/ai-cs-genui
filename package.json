@@ -14,6 +14,7 @@
     "typecheck": "tsc --noEmit",
     "selftest": "tsx scripts/selftest.ts",
     "check:persist": "tsx scripts/persistence-check.ts write && tsx scripts/persistence-check.ts verify",
+    "check:deploy": "tsx scripts/deploy-check.ts",
     "eval": "tsx eval/run.ts",
     "eval:validate": "tsx eval/validate.ts",
     "eval:ingest": "tsx eval/ingest.ts",
