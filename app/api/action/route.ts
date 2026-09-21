@@ -40,7 +40,8 @@ import type { LLMToolCall } from "@/core/llm/adapter";
 import { isTextOnlyForced } from "@/core/llm";
 import { newCorrelationId } from "@/core/protocol/envelope";
 import { ACTION_HANDLERS } from "@/core/protocol/schema";
-import { TraceBuilder, writeAudit } from "@/core/trace";
+import { TraceBuilder } from "@/core/trace";
+import { attr, closeTurn, hashId, identityAttrs } from "@/core/observability";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -87,7 +88,18 @@ export async function POST(request: Request): Promise<Response> {
       trace.markDegraded(reason);
       await streamText(ctx, userText);
       emit.send("done", { correlationId });
-      writeAudit({ correlationId, parentCorrelationId, sessionId, userId, action, instanceId, rejected: reason });
+      closeTurn({
+        trace,
+        record: { correlationId, parentCorrelationId, sessionId, userId, action, instanceId, rejected: reason },
+        attributes: [
+          ...identityAttrs(sessionId, userId, action),
+          attr("action.name", action),
+          // 动作名来自服务端注册的 handler 清单，是有限集合，可以原样上报；
+          // 拒绝原因同上一条路径，只报哈希（原因串里常带着触发它的值）
+          attr("action.rejected", true),
+          attr("action.reasonHash", hashId(reason)),
+        ],
+      });
     };
 
     // —— ① 实例归属：查不到说明是伪造的，或者这条消息已经翻篇了
@@ -137,17 +149,22 @@ export async function POST(request: Request): Promise<Response> {
     });
     emit.send("done", { correlationId });
 
-    const finished = trace.finish();
-    writeAudit({
-      correlationId,
-      parentCorrelationId,
-      sessionId,
-      userId,
-      action,
-      instanceId,
-      params: redact(params),
-      gates: finished.gates,
-      totalMs: finished.totalMs,
+    closeTurn({
+      trace,
+      record: {
+        correlationId,
+        parentCorrelationId,
+        sessionId,
+        userId,
+        action,
+        instanceId,
+        params: redact(params),
+      },
+      attributes: [
+        ...identityAttrs(sessionId, userId, action),
+        attr("action.name", action),
+        attr("action.rejected", false),
+      ],
     });
     }),
   );

@@ -36,7 +36,8 @@ import {
   withBreaker,
   withTimeout,
 } from "@/core/runtime";
-import { TraceBuilder, writeAudit } from "@/core/trace";
+import { TraceBuilder } from "@/core/trace";
+import { attr, closeTurn, hashId, identityAttrs, toolAttrs } from "@/core/observability";
 
 // 用了 node:fs（审计落盘），必须跑在 Node runtime，不能上 Edge
 export const runtime = "nodejs";
@@ -97,15 +98,10 @@ async function handleTurn(args: {
     appendTurn(session, { role: "assistant", text: hit.reply });
     emit.send("state", { correlationId, aiStatePatch: stateOf(session) });
     emit.send("done", { correlationId });
-    writeAudit({
-      correlationId,
-      sessionId,
-      userId,
-      provider: adapter.name,
-      message: userText,
-      degraded: false,
-      prerouted: true,
-      totalMs: trace.finish().totalMs,
+    closeTurn({
+      trace,
+      record: { correlationId, sessionId, userId, provider: adapter.name, message: userText, prerouted: true },
+      attributes: [...identityAttrs(sessionId, userId, userText), attr("turn.prerouted", true)],
     });
     return;
   }
@@ -194,18 +190,26 @@ async function handleTurn(args: {
   emit.send("state", { correlationId, aiStatePatch: stateOf(session) });
   emit.send("done", { correlationId });
 
-  const finished = trace.finish();
-  writeAudit({
-    correlationId,
-    sessionId,
-    userId,
-    provider: adapter.name,
-    message: userText,
-    toolCalls: decision.toolCalls.map((c) => ({ name: c.name, input: c.input })),
-    components: result.components,
-    degraded: result.degraded,
-    gates: finished.gates,
-    totalMs: finished.totalMs,
+  closeTurn({
+    trace,
+    // 本地这份**带原始入参**，是刻意的：追责时要能回答「当时到底传了什么」，
+    // 而脱敏只针对出境的那一份（attributes）。两个目的不能共用一份数据。
+    record: {
+      correlationId,
+      sessionId,
+      userId,
+      provider: adapter.name,
+      message: userText,
+      toolCalls: decision.toolCalls.map((c) => ({ name: c.name, input: c.input })),
+      components: result.components,
+      degraded: result.degraded,
+    },
+    attributes: [
+      ...identityAttrs(sessionId, userId, userText),
+      ...toolAttrs(decision.toolCalls),
+      attr("component.count", result.components.length),
+      attr("turn.degraded", result.degraded),
+    ],
   });
 }
 
@@ -242,15 +246,27 @@ async function degradeTurn(args: {
   emit.send("state", { correlationId, aiStatePatch: stateOf(session) });
   emit.send("done", { correlationId });
 
-  writeAudit({
-    correlationId,
-    sessionId: args.sessionId,
-    userId: args.userId,
-    provider: args.provider,
-    message: userText,
-    degraded: true,
-    degradedReason: args.reason,
-    totalMs: trace.finish().totalMs,
+  closeTurn({
+    trace,
+    record: {
+      correlationId,
+      sessionId: args.sessionId,
+      userId: args.userId,
+      provider: args.provider,
+      message: userText,
+      degraded: true,
+      degradedReason: args.reason,
+    },
+    attributes: [
+      ...identityAttrs(args.sessionId, args.userId, userText),
+      attr("turn.degraded", true),
+      // 降级原因**只上报一个哈希**，不报原文。
+      // 原因串是拼接出来的，里面经常带着触发它的那个值
+      // （校验失败的消息天然会引用被判为非法的输入），
+      // 所以它和用户原话、订单号属于同一类：本地留着，不出网。
+      // 哈希仍然可用 —— 同一个原因在不同轮次会得到同一个值，能分组、能计数。
+      attr("degrade.reasonHash", hashId(args.reason)),
+    ],
   });
 }
 

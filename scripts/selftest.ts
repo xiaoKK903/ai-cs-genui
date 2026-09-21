@@ -1353,6 +1353,362 @@ section("十二、MCP 服务端");
 }
 
 /* ============================================================
+   十三、可观测性出口
+
+   这一节的重点不是「能不能编出 OTLP 报文」，而是**出境的那份数据里有什么**。
+   所以断言分两组：一组查脱敏（不该出网的有没有出网），一组查协议
+   （编出来的报文后端认不认）。协议那一组走真的 HTTP 回环，
+   不是拿自己编的对象自己断言 —— 后者只能证明「我编的和我想的一样」。
+   ============================================================ */
+
+section("十三、可观测性出口");
+{
+  const { attr, createSink, closeTurn, encodeTurn, hashId, identityAttrs, isInteresting, redactMessage, redactToolArgs, resetSink, shouldExport, toolAttrs, traceIdOf } =
+    await import("../core/observability");
+  const { TraceBuilder, readAudit } = await import("../core/trace");
+
+  /* ---------- 脱敏：白名单从 Schema 推出来 ---------- */
+
+  const orderArgs = redactToolArgs("show_order_table", { timeRange: "last30d", orderNo: "SO-20260901-0001" });
+  assert(
+    "脱敏：有 enum 的参数报原值（timeRange 取值来自有限集合）",
+    orderArgs.values.timeRange === "last30d",
+    JSON.stringify(orderArgs.values),
+  );
+  assert(
+    "脱敏：自由字符串只报键名，值一个字节都不出网（orderNo）",
+    !("orderNo" in orderArgs.values) && orderArgs.omitted.includes("orderNo"),
+    JSON.stringify(orderArgs),
+  );
+  assert(
+    "脱敏：整个结果里搜不到订单号 —— 换条路（比如塞进下一个字段）也带不出去",
+    !JSON.stringify(orderArgs).includes("SO-20260901-0001"),
+  );
+
+  const bounded = redactToolArgs("show_order_table", { timeRange: "all", limit: 25 });
+  assert("脱敏：数值同时给了上下界才算有界，可以报原值", bounded.values.limit === 25);
+
+  const unknown = redactToolArgs("tool_that_does_not_exist", { anything: "sensitive-value" });
+  assert(
+    "脱敏：未注册的工具走最严分支（全部只报键名）—— 新工具上线那天没人会记得改脱敏",
+    Object.keys(unknown.values).length === 0 && unknown.omitted.includes("anything"),
+  );
+
+  const msg = redactMessage("我的手机号是13800138000，帮我退款");
+  assert(
+    "脱敏：用户原话只上报长度分桶，原文不出现",
+    msg.lengthBucket === "9-32" && !JSON.stringify(msg).includes("13800138000"),
+  );
+
+  assert("脱敏：同一个 ID 两次哈希一致（能跨轮次聚合）", hashId("U-880417") === hashId("U-880417"));
+  assert("脱敏：不同 ID 哈希不同", hashId("U-880417") !== hashId("U-119002"));
+  assert("脱敏：哈希里不含原值（不可反查）", !hashId("U-880417").includes("880417"));
+
+  /* ---------- OTLP 编码 ---------- */
+
+  const mkTrace = (id: string, degraded = false, failStep = false) => {
+    const t = new TraceBuilder(id);
+    t.gate1(1, true);
+    t.gate2(true);
+    t.note("llm.decide", "选了 show_order_table");
+    if (degraded) t.markDegraded("闸2 拒绝");
+    return t;
+  };
+
+  // failed 步骤必须由 trace.run 里真的抛出来才会被标成 failed ——
+  // note() 永远记 ok。用 note 伪造一条 failed 步骤，测的就不是真实行为了。
+  const mkFailedTrace = async (id: string) => {
+    const t = new TraceBuilder(id);
+    t.note("llm.decide", "选了 show_order_table");
+    try {
+      await t.run("tool:show_order_table", () => {
+        throw new Error("取数失败");
+      });
+    } catch {
+      // 上层会降级，这里只关心 trace 记成了什么
+    }
+    return t.finish();
+  };
+
+  const t1 = mkTrace("msg_test_abc").finish();
+  const encoded = encodeTurn(t1, { turnAttributes: [attr("user.hash", hashId("U-1"))] });
+  const rs = (encoded.resourceSpans as Record<string, unknown>[])[0];
+  const spans = ((rs.scopeSpans as Record<string, unknown>[])[0].spans as Record<string, unknown>[]);
+  const root = spans[0];
+
+  assert(
+    "OTLP：traceId 是 32 位十六进制、spanId 是 16 位，且都不全零",
+    /^[0-9a-f]{32}$/.test(String(root.traceId)) &&
+      /^[0-9a-f]{16}$/.test(String(root.spanId)) &&
+      !/^0+$/.test(String(root.traceId)),
+    String(root.traceId),
+  );
+  assert(
+    "OTLP：同一个 correlationId 永远映射到同一个 traceId（导出重试不会造成重复 trace）",
+    traceIdOf("msg_test_abc") === traceIdOf("msg_test_abc") && traceIdOf("msg_test_abc") !== traceIdOf("msg_test_xyz"),
+  );
+  assert(
+    "OTLP：根 span 没有 parentSpanId，子 span 的 parent 指向根（否则后端画不出调用树）",
+    root.parentSpanId === undefined && spans.slice(1).every((s) => s.parentSpanId === root.spanId),
+  );
+  assert(
+    "OTLP：时间是**纳秒字符串**（传毫秒进去后端会以为是 1970 年）",
+    String(root.startTimeUnixNano) === String(t1.startedAt * 1_000_000) && /^\d+$/.test(String(root.startTimeUnixNano)),
+  );
+  const rootAttrs = root.attributes as { key: string; value: Record<string, unknown> }[];
+  const totalAttr = rootAttrs.find((a) => a.key === "turn.totalMs");
+  assert(
+    "OTLP：整数属性是 intValue 且值是**字符串**（int64 超出 JSON number 安全范围）",
+    totalAttr?.value.intValue !== undefined && typeof totalAttr.value.intValue === "string",
+    JSON.stringify(totalAttr),
+  );
+  assert(
+    "OTLP：resource 上必须有 service.name —— 省了后端会把多个服务的 trace 混成一坨",
+    (rs.resource as { attributes: { key: string }[] }).attributes.some((a) => a.key === "service.name"),
+  );
+
+  const failed = encodeTurn(await mkFailedTrace("msg_test_fail")) as Record<string, unknown>;
+  const failedSpans = ((failed.resourceSpans as Record<string, unknown>[])[0].scopeSpans as Record<string, unknown>[])[0].spans as Record<string, unknown>[];
+  assert(
+    "OTLP：failed 的步骤标成 ERROR(2)",
+    failedSpans.some((s) => (s.status as { code: number }).code === 2),
+  );
+  const deg = encodeTurn(mkTrace("msg_test_deg", true).finish()) as Record<string, unknown>;
+  const degSpans = ((deg.resourceSpans as Record<string, unknown>[])[0].scopeSpans as Record<string, unknown>[])[0].spans as Record<string, unknown>[];
+  assert(
+    "OTLP：降级的轮次**不**标 ERROR —— 用户拿到了正确内容，把它算进错误率会让告警阈值失去意义",
+    degSpans.every((s) => (s.status as { code: number }).code === 1),
+  );
+  assert(
+    "OTLP：步骤 detail 默认不上报（错误消息经常原样带着触发它的那个输入）",
+    !JSON.stringify(degSpans).includes("llm.decide") || !JSON.stringify(degSpans).includes("选了 show_order_table"),
+  );
+  const withDetail = encodeTurn(t1, { includeDetail: true }) as Record<string, unknown>;
+  assert(
+    "OTLP：显式打开 includeDetail 才上报 detail",
+    JSON.stringify(withDetail).includes("选了 show_order_table"),
+  );
+
+  /* ---------- 采样 ---------- */
+
+  const normal = mkTrace("msg_normal_1").finish();
+  const degradedTrace = mkTrace("msg_deg_1", true).finish();
+  const rejectedGate = (() => {
+    const t = new TraceBuilder("msg_rej_1");
+    t.gate1(3, false, "闸1 重试耗尽");
+    return t.finish();
+  })();
+  const prerouted = (() => {
+    const t = new TraceBuilder("msg_pre_1");
+    t.note("预路由命中", "纯招呼语");
+    return t.finish();
+  })();
+
+  assert(
+    "采样：降级的轮次在 rate=0 时**仍然**上报（按比例采样会恰好把出问题的那些丢掉）",
+    shouldExport(degradedTrace, 0) === true && isInteresting(degradedTrace),
+  );
+  assert("采样：闸1 试过且被拒的轮次强制上报", shouldExport(rejectedGate, 0) === true);
+  assert(
+    "采样：预路由的轮次**不算** interesting —— 它没调过模型，attempts=0 不是「闸1 失败」",
+    isInteresting(prerouted) === false,
+  );
+  assert("采样：rate=1 全报", shouldExport(normal, 1) === true);
+  assert("采样：rate=0 时普通轮次不报", shouldExport(normal, 0) === false);
+  assert(
+    "采样：确定性 —— 同一个 correlationId 反复判定结果一致（用随机数会让复现时「这次没采到」）",
+    shouldExport(normal, 0.5) === shouldExport(normal, 0.5),
+  );
+
+  /* ---------- 队列 ---------- */
+
+  let posts = 0;
+  const boom = createSink({
+    endpoint: "http://127.0.0.1:1/never",
+    post: async () => {
+      posts += 1;
+      throw new Error("下游挂了");
+    },
+  });
+  boom.enqueue(normal, []);
+  await boom.flush();
+  assert(
+    "队列：发送失败只计数、不抛错（观测链路的故障不该让一次客服对话挂掉）",
+    posts === 1 && boom.stats.failed === 1,
+  );
+
+  // 要造出背压才能测到「丢最旧」：post 不 resolve，队列才会真的堆起来。
+  // 第一版用 `post: async () => {}` 什么也测不到 —— 每次 enqueue 时队列都已经排空了，
+  // 从没到过上限，断言必然失败，而且失败得莫名其妙（看起来像丢最旧的逻辑坏了）。
+  //
+  // 第二版只断言 dropped 计数，仍然测不出东西：把 shift 改成 pop（丢最新）
+  // 计数一模一样。所以改成**按身份断言保留下来的那几条**，这才区分得开。
+  const sentIds: string[] = [];
+  let releasePost: () => void = () => {};
+  let first = true;
+  const blocked = createSink({
+    endpoint: "http://x/",
+    maxQueue: 2,
+    batchSize: 8,
+    post: (_url, body) => {
+      const parsed = JSON.parse(body) as { resourceSpans: Record<string, unknown>[] };
+      for (const rs of parsed.resourceSpans) {
+        const scopes = (rs.scopeSpans ?? []) as Record<string, unknown>[];
+        const spans = (scopes[0]?.spans ?? []) as Record<string, unknown>[];
+        sentIds.push(String(spans[0]?.traceId));
+      }
+      // 第一条卡住不返回，把队列逼到上限；后面的一次放行
+      if (first) {
+        first = false;
+        return new Promise<void>((r) => {
+          releasePost = r;
+        });
+      }
+      return Promise.resolve();
+    },
+  });
+  // 用 traceId 当身份不方便看，换成把 correlationId 映射成可读的 traceId
+  const ids = ["q1", "q2", "q3", "q4"].map((n) => ({ name: n, trace: mkTrace(`msg_${n}`).finish() }));
+  blocked.enqueue(ids[0].trace, []);
+  await Promise.resolve();
+  await Promise.resolve();
+  blocked.enqueue(ids[1].trace, []);
+  blocked.enqueue(ids[2].trace, []);
+  blocked.enqueue(ids[3].trace, []); // 这条该被丢（最旧的是 q2）
+  assert(
+    "队列：满了丢最旧，且 dropped 计数可见（静默丢弃比没有观测更糟 —— 它会让你以为看到的是全部）",
+    blocked.stats.dropped === 1 && blocked.stats.pending === 2,
+    JSON.stringify(blocked.stats),
+  );
+  releasePost();
+  await blocked.flush();
+  const kept = new Set(sentIds);
+  assert(
+    "队列：丢的确实是**最旧**那条（q2 被丢，q1/q3/q4 都发出去了）—— 只看 dropped 计数区分不出丢最旧还是丢最新",
+    !kept.has(traceIdOf("msg_q2")) && kept.has(traceIdOf("msg_q1")) && kept.has(traceIdOf("msg_q3")) && kept.has(traceIdOf("msg_q4")),
+    `保留：${[...kept].map((t) => (t === traceIdOf("msg_q1") ? "q1" : t === traceIdOf("msg_q2") ? "q2" : t === traceIdOf("msg_q3") ? "q3" : t === traceIdOf("msg_q4") ? "q4" : t)).join(",")}`,
+  );
+
+  const counted = createSink({ endpoint: "http://x/", post: async () => {} });
+  counted.enqueue(normal, []);
+  assert("队列：被采样过滤掉的不算 sent 也不算 dropped，单独计数", counted.stats.sampled === 0);
+  const zeroRate = createSink({ endpoint: "http://x/", sampleRate: 0, post: async () => {} });
+  zeroRate.enqueue(normal, []);
+  assert("队列：采样过滤单独计数（sampled）", zeroRate.stats.sampled === 1 && zeroRate.stats.sent === 0);
+
+  /* ---------- 端到端：真的 POST 到一个回环接收端 ---------- */
+
+  const http = await import("node:http");
+  const received: { url: string; contentType: string; body: unknown }[] = [];
+  const server = http.createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => (raw += c));
+    req.on("end", () => {
+      received.push({
+        url: req.url ?? "",
+        contentType: String(req.headers["content-type"] ?? ""),
+        body: JSON.parse(raw),
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as { port: number }).port;
+
+  const e2e = createSink({
+    endpoint: `http://127.0.0.1:${port}/v1/traces`,
+    includeDetail: false,
+    post: async (url, body, headers, timeoutMs) => {
+      // 走真的 fetch，不绕过传输层 —— 否则「编出来的报文后端认不认」这条就没验
+      const { default: _ } = { default: 0 };
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), timeoutMs);
+      try {
+        const res = await fetch(url, { method: "POST", headers, body, signal: ctl.signal });
+        if (!res.ok) throw new Error(String(res.status));
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+  });
+
+  const auditBefore = process.env.AUDIT_LOG;
+  process.env.AUDIT_LOG = "on";
+  const e2eTrace = new TraceBuilder("msg_e2e_1");
+  e2eTrace.note("llm.decide", "选了 show_order_table");
+  const e2eCorrelation = `e2e_${Date.now().toString(36)}`;
+  const e2eBuilder = new TraceBuilder(e2eCorrelation);
+  e2eBuilder.note("llm.decide", "x");
+
+  // 直接走 closeTurn：落盘 + 入队。sink 用 env 注入不了，所以这里手动串
+  const finished = e2eBuilder.finish();
+  e2e.enqueue(finished, identityAttrs("sess_e2e", "U-e2e-1", "我的订单里有手机号13800138000"));
+
+  // 落盘那一半单独验：即使上报整个挂掉，审计也必须已经写下去了
+  const sinkBackup = process.env.OBSERVABILITY_OTLP_ENDPOINT;
+  process.env.OBSERVABILITY_OTLP_ENDPOINT = "http://127.0.0.1:1/dead";
+  resetSink();
+  // correlationId 每轮唯一：审计文件是 append-only 的，用固定 id 会让
+  // 第二次运行读到上一轮的记录，断言从「落盘了一次」变成「落盘了 N 次」——
+  // 一条会随运行次数变化的断言，等于一条迟早会红的断言。
+  const auditId = `msg_audit_${Date.now().toString(36)}`;
+  // 塞一个**真的会抛**的 sink 进来。
+  // 用真 sink 测不出这条性质 —— 它被设计成永不抛错（有界队列 + 内部 try），
+  // 所以「上报挂了影响落盘吗」在正常路径上永远看不到。
+  const explodingSink = {
+    enqueue() {
+      throw new Error("sink 实现自己有 bug");
+    },
+    async flush() {},
+    stats: { sent: 0, sampled: 0, dropped: 0, failed: 0, pending: 0 },
+  };
+  const closed = closeTurn({
+    trace: mkTrace(auditId),
+    record: { correlationId: auditId, sessionId: "s", userId: "u", message: "x" },
+    attributes: [],
+    sinkOverride: explodingSink,
+  });
+  assert(
+    "端到端：sink 抛错时 closeTurn 不抛错，且仍然返回完整的 TurnTrace",
+    typeof closed.correlationId === "string" && Array.isArray(closed.steps),
+  );
+  assert(
+    "端到端：**先落盘再上报** —— 上报整个挂掉，本地审计也已经写下去了",
+    readAudit(auditId).length === 1,
+    JSON.stringify(readAudit(auditId)),
+  );
+  process.env.AUDIT_LOG = auditBefore;
+  if (sinkBackup === undefined) delete process.env.OBSERVABILITY_OTLP_ENDPOINT;
+  else process.env.OBSERVABILITY_OTLP_ENDPOINT = sinkBackup;
+  resetSink();
+
+  await e2e.flush();
+  await new Promise<void>((r) => server.close(() => r()));
+
+  assert("端到端：回环接收端真的收到了 POST", received.length === 1, `收到 ${received.length} 次`);
+  const got = received[0];
+  assert("端到端：打到 /v1/traces，Content-Type 是 application/json", got?.url === "/v1/traces" && got.contentType === "application/json");
+  const gotRs = (got?.body as { resourceSpans?: Record<string, unknown>[] })?.resourceSpans?.[0];
+  const gotScopes = (gotRs?.scopeSpans ?? []) as Record<string, unknown>[];
+  const gotSpans = (gotScopes[0]?.spans ?? []) as Record<string, unknown>[];
+  assert("端到端：报文里有根 span + 步骤 span", gotSpans.length === 2, `实际 ${gotSpans.length}`);
+  assert(
+    "端到端：**出境的报文里搜不到手机号**（用户原话只以长度分桶的形式出去）",
+    !JSON.stringify(got?.body).includes("13800138000"),
+    JSON.stringify(got?.body).slice(0, 200),
+  );
+  assert(
+    "端到端：出境的报文里搜不到 sessionId / userId 原值",
+    !JSON.stringify(got?.body).includes("sess_e2e") && !JSON.stringify(got?.body).includes("U-e2e-1"),
+  );
+  assert(
+    "端到端：detail 里带用户输入时也不出境（默认关的意义就在这）",
+    !JSON.stringify(got?.body).includes("选了 show_order_table"),
+  );
+}
+
+/* ============================================================
    汇总
    ============================================================ */
 
