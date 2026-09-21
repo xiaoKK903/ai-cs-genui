@@ -49,7 +49,7 @@ const { detectInjection } = await import("../core/guardrails/injection");
 const { gate1ValidateToolInput, gate2CheckEnvelope, gate2CheckToolInput, gate3CheckEnvelope } = await import(
   "../core/guardrails/gates"
 );
-const { makeRegistry, SUPPORTED_COMPONENT_VERSIONS } = await import("../components/genui/supported");
+const { makeRegistry, SUPPORTED_COMPONENT_VERSIONS, olderBundleVersions } = await import("../components/genui/supported");
 
 const frontendRegistryLite = makeRegistry(SUPPORTED_COMPONENT_VERSIONS);
 const db = await import("../core/data/order-service");
@@ -794,8 +794,8 @@ const { RENDERABLE_COMPONENT_VERSIONS } = await import("../core/protocol/envelop
   assert("版本：未知版本仍然被拦（v3 不存在）", !checkEnvelope({ ...v2Env, componentVersion: "3" }).ok);
 
   // —— 灰度演练：服务端发 v2，两种前端各是什么反应
-  const oldBundle = makeRegistry(SUPPORTED_COMPONENT_VERSIONS); // 今天的线上包，只有 v1
-  const newBundle = makeRegistry({ ...SUPPORTED_COMPONENT_VERSIONS, RefundReasonChart: ["1", "2"] });
+  const oldBundle = makeRegistry(olderBundleVersions()); // 灰度前发出去的旧包，没有 v2
+  const newBundle = makeRegistry(SUPPORTED_COMPONENT_VERSIONS); // 灰度随包一起发的新包
 
   const onOld = gate3CheckEnvelope(v2Env, oldBundle);
   assert("共存：老前端拿到 v2 被闸3 拦下", !onOld.passed);
@@ -844,6 +844,78 @@ const { RENDERABLE_COMPONENT_VERSIONS } = await import("../core/protocol/envelop
   } finally {
     process.env.ROLLOUT = "";
   }
+}
+
+/* ============================================================
+   十、契约一致性：发版顺序与演进拐点
+
+   ## 这一节存在的原因
+
+   灰度的真实事故不是「分桶算错了」，而是**发版顺序错了**：协议层加了 v2、
+   工具开始下发 v2、分桶也配好了 —— 但前端包里没人把 v2 写进渲染清单。
+   于是灰度开关一打开的瞬间，闸3 把每一个 v2 信封都判成「版本未注册」，
+   全量用户看到的是降级文本块。**功能没坏，但没人看得到。**
+
+   这类事故的特征是「平时无感、到点雪崩」，靠人记是记不住的 ——
+   所以把它变成一条会红的断言。
+   ============================================================ */
+
+{
+  const { COMPONENT_NAMES, COMPONENT_VERSION_SCHEMAS } = await import("../core/protocol/schema");
+  const { RENDERABLE_COMPONENT_VERSIONS } = await import("../core/protocol/envelope");
+  const { TOOL_NAMES } = await import("../core/tools/definitions");
+
+  // —— 一致性①：协议允许下发的每个版本，前端包都必须声明能渲染
+  const missing: string[] = [];
+  for (const name of COMPONENT_NAMES) {
+    for (const version of RENDERABLE_COMPONENT_VERSIONS[name] ?? []) {
+      if (!SUPPORTED_COMPONENT_VERSIONS[name]?.includes(version)) missing.push(`${name}@${version}`);
+    }
+  }
+  assert(
+    "契约：协议可下发的版本，前端包全都声明能渲染（灰度打开不会全量降级）",
+    missing.length === 0,
+    missing.length > 0 ? `前端清单缺：${missing.join("、")} —— 先发前端包再开灰度` : "",
+  );
+
+  // —— 一致性②：清单里声明的版本必须真有 Schema，否则闸2 先把它拦了
+  const noSchema: string[] = [];
+  for (const name of COMPONENT_NAMES) {
+    for (const version of SUPPORTED_COMPONENT_VERSIONS[name] ?? []) {
+      if (!COMPONENT_VERSION_SCHEMAS[name]?.[version]) noSchema.push(`${name}@${version}`);
+    }
+    if ((SUPPORTED_COMPONENT_VERSIONS[name] ?? []).length === 0) noSchema.push(`${name}（清单为空）`);
+  }
+  assert("契约：清单里每个版本都有对应 Schema", noSchema.length === 0, noSchema.join("、"));
+
+  // —— 一致性③：每个组件至少有一个版本，且注册表能把它列出来
+  const empty = COMPONENT_NAMES.filter((n) => (COMPONENT_VERSION_SCHEMAS[n] ? Object.keys(COMPONENT_VERSION_SCHEMAS[n]).length : 0) === 0);
+  assert("契约：每个组件至少登记一个版本的 Schema", empty.length === 0, empty.join("、"));
+
+  const listed = new Set(frontendRegistryLite.list());
+  const unrenderable = COMPONENT_NAMES.filter((n) => !listed.has(`${n}@1`));
+  assert("契约：每个组件都注册了渲染入口（闸3 认得出 v1）", unrenderable.length === 0, unrenderable.join("、"));
+
+  // —— 一致性④：旧包清单是从当前包减出来的，不是另外手写的
+  const older = olderBundleVersions();
+  assert(
+    "契约：旧包清单 = 当前包去掉 v2（不会出现「测试里的旧包比真实旧包还旧」）",
+    COMPONENT_NAMES.every((n) => (older[n] ?? []).every((v) => (SUPPORTED_COMPONENT_VERSIONS[n] ?? []).includes(v))),
+  );
+  assert(
+    "契约：旧包清单确实少了 v2（否则灰度演练是假的）",
+    (older.RefundReasonChart ?? []).includes("2") === false,
+  );
+
+  // —— 拐点计数：第六阶段那两条红线，到点强制升级，不靠自觉
+  // 这里只报数不判红：跨过阈值是正常的业务增长，该做的是按计划升级，不是让 CI 挂。
+  // 但它每次跑都会打在屏幕上 —— 一条会被看见的数字，比一句写在文档里的红线有用。
+  const toolCount = TOOL_NAMES.length;
+  const componentCount = COMPONENT_NAMES.length;
+  const near = (n: number, limit: number) => (n >= limit ? "已越线，该上治理" : n >= limit * 0.6 ? "接近" : "健康");
+  console.log(
+    `  · 拐点计数：工具 ${toolCount}/15（${near(toolCount, 15)}） · 组件 ${componentCount}/20（${near(componentCount, 20)}）`,
+  );
 }
 
 /* ============================================================
