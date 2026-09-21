@@ -20,6 +20,7 @@
     "eval:trend": "tsx eval/trend.ts",
     "regress": "tsx eval/validate.ts && tsx eval/run.ts --strict",
     "bench": "tsx scripts/bench.ts",
+    "mcp": "tsx mcp/main.ts",
     "check": "npm run typecheck && npm run selftest && npm run check:persist && npm run regress"
   },
   "dependencies": {
