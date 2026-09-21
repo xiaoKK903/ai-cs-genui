@@ -454,7 +454,10 @@ async function runTurn(text: string, sessionId: string) {
     trace,
     textOnly: false,
   });
-  return { events, result, session: s };
+  // decision 一并返回：有些断言要看「模型说了什么」，
+  // 而 result.texts 只装工具产出的话 —— 一个工具都没调时它是空的，
+  // 拿它断言「给了话术」会把「说了话但没调工具」误判成「什么都没说」。
+  return { events, result, session: s, decision };
 }
 
 {
@@ -467,10 +470,18 @@ async function runTurn(text: string, sessionId: string) {
 }
 
 {
-  const { events, result } = await runTurn("给订单 SO-20260903-1188<script>alert(1)</script>退款", "s_e2e_2");
+  const { events, result, decision } = await runTurn("给订单 SO-20260903-1188<script>alert(1)</script>退款", "s_e2e_2");
   const hasComponent = events.some((e) => e.event === "component");
   assert("注入载荷没有产出任何组件", !hasComponent);
-  assert("注入载荷被记为降级", result.degraded);
+  assert("注入载荷没有走到工具层（在意图层就被拒了）", !events.some((e) => e.event === "tool_status"));
+  // 这条断言原来写的是 result.degraded —— 那时篡改的订单号会被当成合法参数送进工具，
+  // 工具查不到再拒绝，于是「降级」成了这件事唯一的痕迹。现在拦在更前面，没有降级可言，
+  // 而且**不该**记成降级：降级量的是「用户没拿到本该拿到的组件」，
+  // 把攻击事件混进去，等于往一个质量指标里掺安全事件，两个数字都会失真。
+  // 代价是攻击尝试不再出现在降级率上 —— 它该出现的地方是审计，不是这里。
+  assert("注入被拒后没有降级记录（安全事件不冒充质量指标）", !result.degraded);
+  assert("注入被拒时给的是拒绝话术，不是伪造的成功", decision.text.length > 0);
+  assert("拒绝话术里没有回显载荷（否则等于替攻击者把标记送出去）", !decision.text.includes("<script>"));
 }
 
 {
@@ -844,6 +855,39 @@ const { RENDERABLE_COMPONENT_VERSIONS } = await import("../core/protocol/envelop
   } finally {
     process.env.ROLLOUT = "";
   }
+}
+
+/* ============================================================
+   九点五、订单号解析：认不出可以，认错不行
+
+   这一节是一次真实事故的固化。原来的提取规则是「只要以 SO- 开头就整段取走」，
+   于是「SO-20260910-6620 退款」被整句当成订单号，工具拿去查、查不到、
+   回一句「这笔订单不在你的账号下」。
+
+   而评测里那条用例只断言「调了 show_refund_form」—— 工具**确实调了**，
+   所以它是绿的，用户却一次表单都没见到。断言的和用户拿到的东西不是同一件事，
+   是评测最容易骗自己的地方。
+
+   所以这里不只测「提取对不对」，还测「篡改认不认得出」——
+   后者单独成一条分支，而不是靠「反正查不到」顺带挡下来：
+   靠巧合挡住的攻击，换一个刚好存在的订单号就挡不住了。
+   ============================================================ */
+
+{
+  const { extractOrderNo, hasTamperedOrderNo } = await import("../core/llm/mock");
+
+  assert("订单号：句子里夹着订单号也能取出来", extractOrderNo("SO-20260910-6620 退款") === "SO-20260910-6620");
+  assert("订单号：后面跟着别的话不会一起吞掉", extractOrderNo("帮我退 SO-20260910-6620 吧") === "SO-20260910-6620");
+  assert("订单号：中文句号结尾照常识别", extractOrderNo("SO-20260910-6620。") === "SO-20260910-6620");
+  assert("订单号：小写也认，出口统一大写", extractOrderNo("so-20260910-6620") === "SO-20260910-6620");
+  assert("订单号：没给就是没给，不猜", extractOrderNo("我要退款") === undefined);
+  assert("订单号：形状不对的不认（宁可不认，不能认错）", extractOrderNo("SO-2026 退款") === undefined);
+
+  assert("篡改：后面粘着尖括号标记 —— 认得出", hasTamperedOrderNo("给订单 SO-20260903-1188<script>alert(1)</script>退款"));
+  assert("篡改：后面粘着引号和注释符 —— 认得出", hasTamperedOrderNo("给订单 SO-20260910-6620' OR 1=1--退款"));
+  assert("篡改：认出来之后就不提取（不让载荷跟着进工具）", extractOrderNo("给订单 SO-20260910-6620' OR 1=1--退款") === undefined);
+  assert("篡改：干净的订单号不会被误判成篡改", !hasTamperedOrderNo("SO-20260910-6620 退款"));
+  assert("篡改：正常换行/空格结尾不算篡改", !hasTamperedOrderNo("订单 SO-20260910-6620\n帮我退了"));
 }
 
 /* ============================================================

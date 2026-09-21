@@ -53,7 +53,12 @@ const { getAdapter } = await import("../core/llm");
 const { buildSystemPrompt } = await import("../core/llm/prompt");
 const { getOrCreateSession, setLastOrderNo, setLastRefundResult } = await import("../core/data/session");
 const { dispatchToolCalls } = await import("../core/gateway/dispatch");
-const { gate1ValidateToolInput } = await import("../core/guardrails/gates");
+const { gate1ValidateToolInput, gate3CheckEnvelope } = await import("../core/guardrails/gates");
+const { TOOL_COMPONENT_MAP } = await import("../core/tools/definitions");
+const { makeRegistry, SUPPORTED_COMPONENT_VERSIONS } = await import("../components/genui/supported");
+
+/** 前端包实际能渲染的版本 —— 闸3 的判定依据，取的是那份纯数据清单而不是协议层的白名单 */
+const frontendRegistryLite = makeRegistry(SUPPORTED_COMPONENT_VERSIONS);
 const { TraceBuilder } = await import("../core/trace");
 const { newCorrelationId } = await import("../core/protocol/envelope");
 const { DEMO_SESSION_USER_ID, submitRefund } = await import("../core/data/order-service");
@@ -118,6 +123,20 @@ interface CaseResult {
   reasons: string[];
   toolCalls: string[];
   components: string[];
+  /** 上线门槛用的一组原始计数 —— 判定口径见「上线门槛」一节 */
+  metrics: {
+    /** 这条用例声明了「该出组件」还是「该出文本」；null = 没声明（对抗层多数如此），不进意图准确率 */
+    intentExpected: "component" | "text" | null;
+    /** 模型实际有没有走组件路径（看工具调用，不看最终渲染） */
+    intentGotComponent: boolean;
+    /** 组件选择：可接受的组件集合（anyOf 就是多个），与实际渲染出的第一个组件 */
+    expectedComponents: string[];
+    gotComponent: string | null;
+    gate1Calls: number;
+    gate1Rejected: number;
+    /** 这一轮下发的组件信封，逐个过闸3 的结果 */
+    envelopeGate3: boolean[];
+  };
 }
 
 const HTML_PATTERN = /<\s*(script|table|div|iframe|img|svg|style|a)\b/i;
@@ -246,7 +265,47 @@ async function runCase(c: Case): Promise<CaseResult> {
     }
   }
 
-  return { id: c.id, layer: c.layer, input: c.input, ok: reasons.length === 0, reasons, toolCalls, components };
+  // —— 上线门槛的原始计数
+  //
+  // 意图判定看**工具调用**而不是最终渲染：被闸2 降级成文本的那一刻，
+  // 「模型想不想出组件」已经和「用户看没看到组件」分家了。
+  // 混在一起算，会把降级记成意图错 —— 那是两个完全不同的故障，
+  // 一个改 prompt，一个查闸门。
+  const intentGotComponent = decision.toolCalls.some((t) => TOOL_COMPONENT_MAP[t.name] !== undefined);
+  const intentExpected: "component" | "text" | null =
+    e.tool === null ? "text" : e.tool !== undefined || e.anyOf ? "component" : null;
+
+  // anyOf 是「这条输入本来就有歧义，几个组件都算对」—— 拿 anyOf[0] 当唯一期望，
+  // 会把模型选中的另一个正确答案判成错，指标凭空低一截。可接受的就是整个集合。
+  const acceptedTools = e.anyOf ?? (typeof e.tool === "string" ? [e.tool] : []);
+  const expectedComponents = acceptedTools
+    .map((t) => TOOL_COMPONENT_MAP[t])
+    .filter((x): x is NonNullable<typeof x> => x !== undefined);
+
+  // 闸3 用前端包自己的渲染清单来查 —— 就是「先发前端包再开灰度」里的那份清单。
+  // 拿协议层的可渲染版本当注册表会让这条指标永远满分，测了个寂寞。
+  const envelopeGate3 = componentEvents.map(
+    (x) => gate3CheckEnvelope(x.data as never, frontendRegistryLite).passed,
+  );
+
+  return {
+    id: c.id,
+    layer: c.layer,
+    input: c.input,
+    ok: reasons.length === 0,
+    reasons,
+    toolCalls,
+    components,
+    metrics: {
+      intentExpected,
+      intentGotComponent,
+      expectedComponents,
+      gotComponent: components[0] ?? null,
+      gate1Calls: decision.toolCalls.length,
+      gate1Rejected: gate1Failures.length,
+      envelopeGate3,
+    },
+  };
 }
 
 /* ---------- 跑 ---------- */
@@ -268,6 +327,17 @@ for (const c of cases) {
       reasons: [`执行异常：${err instanceof Error ? err.message : String(err)}`],
       toolCalls: [],
       components: [],
+      // 异常用例不进任何门槛指标 —— 把它算成「意图错了」是拿一个基础设施故障
+      // 去拉低模型的分，两个数字都会失真。它只出现在分层结果里。
+      metrics: {
+        intentExpected: null,
+        intentGotComponent: false,
+        expectedComponents: [],
+        gotComponent: null,
+        gate1Calls: 0,
+        gate1Rejected: 0,
+        envelopeGate3: [],
+      },
     });
   }
 }
@@ -302,6 +372,119 @@ if (failed.length > 0) {
     for (const reason of f.reasons) console.log(`     · ${reason}`);
   }
 }
+
+/* ---------- 上线门槛 ----------
+
+   第四阶段把指标表列出来了，但一张列在文档里的门槛表，和一条会拦人的门槛，
+   是两回事。这里把**离线可测**的那几个真算出来，对着门槛报数。
+
+   分三类，这个分类本身就是结论：
+
+     离线可测     —— 在这里算，达不到就退出码非零（真模型上才有意义）
+     需要真实流量 —— 转人工率、FCR、CSAT、任务完成率，离线算不出来，
+                    只能在 A/B 里量，写在这里是为了别让人以为它们被测过了
+     需要浏览器   —— CLS，Node 里算不出来（scripts/bench.ts 顶部写了为什么）
+
+   一条口径上的取舍：意图准确率只统计**声明了意图期望**的用例。
+   对抗层大多不声明（攻击失败的正当姿势有很多种），把它们算进来会让这个数字
+   变成一个混合了「意图识别」和「攻击防御」的怪东西。
+*/
+
+interface Gate {
+  name: string;
+  value: number | null;
+  /** 门槛；target 是上限时用 atMost */
+  target: number;
+  atMost?: boolean;
+  note?: string;
+}
+
+const measured = results.filter((r) => r.metrics.intentExpected !== null);
+const intentOk = measured.filter(
+  (r) =>
+    (r.metrics.intentExpected === "component") === r.metrics.intentGotComponent,
+).length;
+
+const withExpectedComponent = results.filter((r) => r.metrics.expectedComponents.length > 0);
+const componentOk = withExpectedComponent.filter(
+  (r) => r.metrics.gotComponent !== null && r.metrics.expectedComponents.includes(r.metrics.gotComponent),
+).length;
+
+const allCalls = results.reduce((s, r) => s + r.metrics.gate1Calls, 0);
+const rejectedCalls = results.reduce((s, r) => s + r.metrics.gate1Rejected, 0);
+
+const allEnvelopes = results.flatMap((r) => r.metrics.envelopeGate3);
+const envelopeOk = allEnvelopes.filter(Boolean).length;
+
+// 降级：声明了「该出组件」却一个信封都没发出来。
+// 分母是「该出组件」的用例数 —— 用总用例数当分母会把闲聊也掺进来，白白稀释。
+const wantComponent = results.filter((r) => r.metrics.intentExpected === "component");
+const degraded = wantComponent.filter((r) => r.metrics.gotComponent === null).length;
+
+const pct = (ok: number, all: number) => (all === 0 ? null : (ok / all) * 100);
+
+const gates: Gate[] = [
+  { name: "意图识别准确率", value: pct(intentOk, measured.length), target: 95, note: `${measured.length} 条声明了期望` },
+  {
+    name: "组件选择正确率",
+    value: pct(componentOk, withExpectedComponent.length),
+    target: 95,
+    note: `${withExpectedComponent.length} 条有期望组件`,
+  },
+  { name: "工具调用成功率", value: pct(allCalls - rejectedCalls, allCalls), target: 99, note: `闸1，${allCalls} 次调用` },
+  {
+    name: "组件渲染成功率",
+    value: pct(envelopeOk, allEnvelopes.length),
+    target: 99.5,
+    note: `闸3，${allEnvelopes.length} 个信封`,
+  },
+  { name: "降级比例", value: pct(degraded, wantComponent.length), target: 5, atMost: true, note: `${wantComponent.length} 条想组件` },
+];
+
+const miss = (g: Gate) =>
+  g.value !== null && (g.atMost ? g.value > g.target : g.value < g.target);
+
+/**
+ * 门槛没达标时，把拖后腿的用例 id 列出来。
+ *
+ * 一个孤零零的百分比只能说明「有问题」，说不出「哪里有问题」——
+ * 而这两件事之间的差距，就是一条指标是能被修好还是只能被围观。
+ */
+const offenders: string[] = [];
+for (const r of measured) {
+  if ((r.metrics.intentExpected === "component") !== r.metrics.intentGotComponent) {
+    offenders.push(`意图  ${r.id}「${r.input}」期望${r.metrics.intentExpected === "component" ? "组件" : "文本"}，实际${r.metrics.intentGotComponent ? "组件" : "文本"}`);
+  }
+}
+for (const r of withExpectedComponent) {
+  if (r.metrics.gotComponent === null || !r.metrics.expectedComponents.includes(r.metrics.gotComponent)) {
+    offenders.push(
+      `选组件 ${r.id}「${r.input}」期望 ${r.metrics.expectedComponents.join("/")}，实际 ${r.metrics.gotComponent ?? "(无组件)"}`,
+    );
+  }
+}
+
+console.log("\n上线门槛（离线可测的部分）");
+const pad2 = (s: string, n: number) => s + " ".repeat(Math.max(0, n - [...s].reduce((w, ch) => w + (/[一-龥]/.test(ch) ? 2 : 1), 0)));
+for (const g of gates) {
+  const shown = g.value === null ? "—" : `${g.value.toFixed(1)}%`;
+  const dir = g.atMost ? "≤" : "≥";
+  console.log(
+    `  ${miss(g) ? "✗" : "✓"} ${pad2(g.name, 16)}${shown.padStart(7)}   ${dir}${String(g.target).padStart(5)}%   ${g.note ?? ""}`,
+  );
+}
+
+if (offenders.length > 0) {
+  console.log("\n  拖后腿的用例（门槛没达标时才有输出）");
+  for (const o of offenders) console.log(`    · ${o}`);
+}
+
+console.log(`
+  未测（离线算不出来，别当成已通过）：
+    CLS ≤ 0.1           浏览器布局事实，Node 里算不出来 —— scripts/bench.ts 顶部写了怎么在浏览器量
+    首包 TTFB ≤ 1.0s    服务端那段在 npm run bench 里量得到；含真实网络的那段要换真模型
+    任务完成率 / FCR / 人工转接率 / CSAT   需要真实流量与 A/B，离线无代理指标
+    关键操作误触发 = 0  这是硬性红线，验证在 selftest（越权 / 金额权威 / 幂等），不在评测集`);
 
 /* ---------- 存档与回归对比 ---------- */
 

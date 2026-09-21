@@ -43,12 +43,45 @@ type Intent =
   | { kind: "tool"; name: string; input: Record<string, unknown>; lead?: string }
   | { kind: "text"; reply: string };
 
-/** 订单号提取。整段粘贴（以 SO- 开头）时整段取走 —— 这正是注入进来的常见形态。 */
-function extractOrderNo(text: string): string | undefined {
-  const trimmed = text.trim();
-  if (/^SO-/i.test(trimmed)) return trimmed;
-  const m = /SO-[^\s，。！？、]+/i.exec(text);
-  return m ? m[0] : undefined;
+/**
+ * 订单号的形状：SO-8位日期-4位序号。
+ *
+ * 原来这里是「只要以 SO- 开头就整段取走」，理由写在注释里：粘贴进来的常见形态就是
+ * 一整段。但那条规则把「SO-20260910-6620 退款」整句当成了订单号 —— 于是工具按这个
+ * 字符串去查，查不到，回一句「这笔订单不在你的账号下」。
+ *
+ * 后果比看起来严重：评测里那条用例只断言「调了 show_refund_form」，
+ * 工具调用确实发生了，所以它是**绿的** —— 用户却一次表单都没见到。
+ * 这是最危险的一种绿：断言的和用户实际拿到的东西不是同一件事。
+ * 所以形状必须写死，宁可认不出，也不能认错。
+ */
+const ORDER_NO = /SO-\d{8}-\d{4}/i;
+
+/** 紧贴在订单号后面的这些字符，说明它后面粘着别的东西（标记、引号、注释符……） */
+const GLUED = /[<'"`;()\[\]{}\/\\|*#]/;
+
+/**
+ * 订单号被篡改了吗。
+ *
+ * 「SO-20260910-6620' OR 1=1--」和「SO-20260903-1188<script>…」都是这个形状：
+ * 一个**合法的**订单号后面直接粘着载荷。这不是打错字，是有人想让它变成别的东西。
+ *
+ * 单独判一次、单独拒一次，而不是靠「反正查不到」顺带挡下来 ——
+ * 靠巧合挡住的攻击，换一个刚好存在的订单号就挡不住了。
+ */
+export function hasTamperedOrderNo(text: string): boolean {
+  const m = ORDER_NO.exec(text);
+  if (!m) return false;
+  const next = text[m.index + m[0].length];
+  return next !== undefined && GLUED.test(next);
+}
+
+/** 订单号提取。认不出就返回 undefined —— 让上层按「没给单号」处理，别猜。 */
+export function extractOrderNo(text: string): string | undefined {
+  const m = ORDER_NO.exec(text);
+  // 后面粘着符号的，不是订单号，是载荷的一部分，不取
+  if (!m || hasTamperedOrderNo(text)) return undefined;
+  return m[0].toUpperCase();
 }
 
 function extractTimeRange(text: string): TimeRange {
@@ -109,6 +142,20 @@ function classify(text: string, ctx: IntentContext): Intent {
   // ② 要的不是业务操作，是「产出点别的东西」—— 在这就断开，别让它顺着业务词往下走
   if (NON_BUSINESS.test(text)) {
     return { kind: "text", reply: smallTalk(text) };
+  }
+
+  // ②′ 订单号后面粘着载荷 —— 明确拒绝，而不是「刚好查不到」
+  //
+  // 这一条必须显式存在。没有它，那两个注入用例会以另一种方式「通过」：
+  // 提取不到订单号 → 走到「没给单号」的兜底 → 拉一张订单表格出来。
+  // 期望是 finalComponent: null，于是照样红 —— 但红的原因变成「多渲染了一个组件」，
+  // 而不是「挡住了注入」。失败信息指向错误的方向，比失败本身更难查。
+  if (hasTamperedOrderNo(text)) {
+    return {
+      kind: "text",
+      reply:
+        "这个订单号后面跟着一串别的东西，我没法确认你指的是哪一笔。把订单号单独发我一次，我马上帮你办。",
+    };
   }
 
   // ③ 退款原因统计 —— 也带「退款」二字，靠 CHART_SIGNAL 与申请退款区分开
