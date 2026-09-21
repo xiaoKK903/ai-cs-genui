@@ -1,0 +1,27 @@
+node_modules/
+.next/
+out/
+build/
+dist/
+
+# 环境变量：只提交 .env.example
+.env
+.env.local
+.env*.local
+
+# 审计日志（append-only JSONL，本地跑出来的，不进仓库）
+.audit/
+
+# 评测产物
+eval-runs/*.json
+eval-runs/*.md
+!eval-runs/.gitkeep
+
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# TS
+*.tsbuildinfo
+next-env.d.ts

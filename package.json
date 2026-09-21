@@ -1,0 +1,30 @@
+{
+  "name": "ai-cs-genui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AI 客服 Generative UI —— Tool Calling + 组件白名单 + SSE 多事件流",
+  "engines": {
+    "node": ">=18.18"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "selftest": "tsx scripts/selftest.ts",
+    "eval": "tsx eval/run.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.127.0",
+    "next": "14.2.33",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.5.4"
+  }
+}
