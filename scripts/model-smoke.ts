@@ -137,13 +137,20 @@ if (!ready) {
 }
 
 /** 一轮的完整 SSE 读到底。模型慢，超时给宽 */
-async function runRound(message: string, sessionId: string): Promise<{ stream: string; events: string[]; correlationId: string }> {
+async function runRound(
+  message: string,
+  sessionId: string,
+): Promise<{ stream: string; events: string[]; correlationId: string; assistantText: string }> {
   const res = await fetch(`${base}/api/chat`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ sessionId, message }),
   });
   let stream = "";
+  let assistantText = "";
+  /** 已经消费到 stream 的哪个位置 —— 每次读回来的是**整个** stream，不记住就会重复累加 */
+  let consumed = 0;
+  const deltaRe = /"delta":"((?:[^"\\]|\\.)*)"/g;
   const reader = res.body?.getReader();
   const decoder = new TextDecoder();
   // 必须比上面那对超时**更宽**，否则先撞到的是这里的读超时，
@@ -153,12 +160,30 @@ async function runRound(message: string, sessionId: string): Promise<{ stream: s
     const { done, value } = await reader.read();
     if (done) break;
     stream += decoder.decode(value, { stream: true });
+
+    // 顺手把文本增量拼起来。**这是为了消歧**：模型没产出工具调用时，
+    // 「它老老实实回了句人话」和「它想调但格式写错了、于是解析器什么都没拿到」
+    // 在 trace 里长得一模一样（都是 text-only、闸1 一次通过）。只报
+    // 「没调工具」的话，后者会被当成前者放过去 —— 而后者说明适配器可能有 bug。
+    // 把模型的原话打出来，这两种情况一眼就能分开。
+    deltaRe.lastIndex = consumed;
+    for (let m = deltaRe.exec(stream); m !== null; m = deltaRe.exec(stream)) {
+      try {
+        assistantText += JSON.parse(`"${m[1]}"`) as string;
+      } catch {
+        // 转义序列被切在半截 —— 不推进 consumed，等下一轮数据补齐再解析这一条
+        break;
+      }
+      consumed = deltaRe.lastIndex;
+    }
+
     if (stream.includes("event: done") || stream.includes("event: error")) break;
   }
   return {
     stream,
     events: [...stream.matchAll(/^event: (.+)$/gm)].map((m) => m[1]),
     correlationId: /"correlationId":"([^"]+)"/.exec(stream)?.[1] ?? "",
+    assistantText,
   };
 }
 
@@ -244,6 +269,10 @@ if ((record?.toolCalls ?? []).length === 0 && !record?.degraded) {
     "注意",
     "这一轮模型没产出结构化工具调用 —— 适配器的工具解析分支本轮未被走到，所以本次绿**不覆盖**工具调用链路",
   );
+  // 把模型的原话打出来：如果它回的是「您好，有什么可以帮您」，那是模型没选工具；
+  // 如果它回的是 `<tool_call>{...}` 这类半成品标记，那是**模型想调、格式没写对** ——
+  // 两种情况的排查方向完全不同，而只看 trace 分不出来。
+  note("模型原话", JSON.stringify(round.assistantText.slice(0, 160)));
 }
 note("服务端判定", record?.degraded ? "降级为纯文本" : "正常");
 note("用户实际拿到", componentCount > 0 ? `${componentCount} 个组件` : "纯文本（没有组件）");
