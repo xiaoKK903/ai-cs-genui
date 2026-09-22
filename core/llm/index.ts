@@ -8,16 +8,29 @@
 import type { LLMAdapter } from "./adapter";
 import { anthropicAdapter } from "./anthropic";
 import { mockAdapter } from "./mock";
+import { ollamaAdapter } from "./ollama";
 
-export type ProviderName = "mock" | "anthropic";
+export type ProviderName = "mock" | "anthropic" | "ollama";
 
 export function resolveProvider(): ProviderName {
   const raw = (process.env.LLM_PROVIDER ?? "mock").trim().toLowerCase();
-  return raw === "anthropic" ? "anthropic" : "mock";
+  if (raw === "mock" || raw === "anthropic" || raw === "ollama") return raw;
+  // 认不出来的值直接炸，**不回退到 mock**。
+  //
+  // 回退看起来很宽容，实际是最坏的一种默认：`LLM_PROVIDER=olamma npm run eval`
+  // 会静默跑 mock，然后打印一个漂亮的 100%，而人以为那是本地模型的成绩。
+  // 这类错最难发现 —— 它不报错，还给个好数字。
+  // 拼错的配置值得一次明确的失败，不值得一次善意的猜测。
+  throw new Error(
+    `LLM_PROVIDER="${raw}" 不认识。可选：mock（默认）/ anthropic / ollama。`,
+  );
 }
 
 export function getAdapter(): LLMAdapter {
-  return resolveProvider() === "anthropic" ? anthropicAdapter : mockAdapter;
+  const provider = resolveProvider();
+  if (provider === "anthropic") return anthropicAdapter;
+  if (provider === "ollama") return ollamaAdapter;
+  return mockAdapter;
 }
 
 /**
@@ -32,5 +45,5 @@ export function isTextOnlyForced(): boolean {
   return v === "on" || v === "true" || v === "1";
 }
 
-export { mockAdapter, anthropicAdapter };
+export { mockAdapter, anthropicAdapter, ollamaAdapter };
 export type { LLMAdapter, LLMDecision, LLMHandlers, LLMRequest, LLMToolCall } from "./adapter";

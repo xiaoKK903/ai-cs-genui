@@ -144,6 +144,8 @@ async function handleTurn(args: {
       provider: adapter.name,
       reason: err instanceof Error ? err.message : String(err),
       fallback: "抱歉，我这轮没处理好。换个说法再问我一次？",
+      // 抛出来的时候调用**没成功**，所以这里确实没有用量可记。
+      usage: { inputTokens: 0, outputTokens: 0 },
     });
     return;
   }
@@ -165,6 +167,10 @@ async function handleTurn(args: {
       provider: adapter.name,
       reason: "闸1 重试耗尽",
       fallback: "抱歉，我这轮没处理好。换个说法再问我一次？",
+      // 这一条**必须**带上：三次重试的钱是真花了的。
+      // 不给它记用量，成本看板上「闸1 重试」这个最该被看见的科目会显示为 0 ——
+      // 而它恰恰是小模型路径上最常见的花钱方式（参数写不对 → 重试 → 再花钱）。
+      usage: outcome.usage,
     });
     return;
   }
@@ -203,6 +209,11 @@ async function handleTurn(args: {
       toolCalls: decision.toolCalls.map((c) => ({ name: c.name, input: c.input })),
       components: result.components,
       degraded: result.degraded,
+      // token 数落进这一轮的记录里。之前只有进程内的 costLedger 有它，
+      // 那是按 session 汇总的、重启就没了 —— 于是「这一轮到底花了多少」
+      // 事后答不出来，而「换个模型这一轮贵了多少」恰恰是个按轮次比的问题。
+      // token 数不是个人信息，出境那份要不要带是另一回事（现在不带）。
+      usage: outcome.usage,
     },
     attributes: [
       ...identityAttrs(sessionId, userId, userText),
@@ -235,6 +246,8 @@ async function degradeTurn(args: {
   provider: string;
   reason: string;
   fallback: string;
+  /** 降级前已经花掉的用量。模型调用失败时是 0，但闸1 重试耗尽时不是 0。 */
+  usage: Usage;
 }): Promise<void> {
   const { emit, trace, session, correlationId, userText, fallback } = args;
   emit.send("text_delta", { delta: fallback, correlationId });
@@ -256,6 +269,9 @@ async function degradeTurn(args: {
       message: userText,
       degraded: true,
       degradedReason: args.reason,
+      // 降级不等于免费。不记这一笔，「这一轮为什么花了钱却没有结果」就永远答不上来 ——
+      // 而闸1 重试正是最典型的「花了钱、没结果」。
+      usage: args.usage,
     },
     attributes: [
       ...identityAttrs(args.sessionId, args.userId, userText),

@@ -4,6 +4,7 @@
  * 跑法：
  *   npm run eval                     # 用默认的 mock 跑基线
  *   npm run eval -- --provider=anthropic   # 用真模型跑（需要 ANTHROPIC_API_KEY）
+ *   npm run eval -- --provider=ollama      # 用本地模型跑（需要 ollama serve + 已拉模型）
  *
  * 这个脚本要回答的问题只有一个：**意图识别这一层，到底有多准。**
  *
@@ -715,8 +716,10 @@ if (withCandidates && candidateResults.length > 0) {
 
 console.log(
   provider === "mock"
-    ? "\n这是 mock 基线。换成真模型：npm run eval -- --provider=anthropic"
-    : "\n真模型结果。与 mock 基线的差值，就是「意图识别」这一层被替换后的净影响。",
+    ? "\n这是 mock 基线。换成真模型：npm run eval -- --provider=anthropic（或 --provider=ollama 跑本地模型）"
+    : provider === "ollama"
+      ? "\n本地模型结果。与 mock 基线的差值里，混着「模型能力」和「模型规模」两件事 —— 这条路的用处是验链路和当能力下限，不是当成绩。"
+      : "\n真模型结果。与 mock 基线的差值，就是「意图识别」这一层被替换后的净影响。",
 );
 
 // 门槛没达标 = 没通过。

@@ -1709,6 +1709,339 @@ section("十三、可观测性出口");
 }
 
 /* ============================================================
+   十四、本地模型适配器（Ollama）
+
+   这一节全部**不联网、不需要模型**：传输层是注入的。
+   验的是适配器自己的协议处理 —— 而恰恰是这部分最容易被「本机跑通了」
+   骗过去：本机 Ollama 永远给对象形状的 arguments、永远按行切好再发，
+   所以「字符串形状」和「JSON 横跨两个 chunk」这两条分支在真机上是死代码。
+   它们要么被喂进去验一遍，要么就是在等一次线上偶发。
+
+   还有一条这里验不了的，写在 section 名里免得误会：模型选得准不准，
+   这一节管不着 —— 那是 eval 的事，而且 3B 模型选不准是正常的。
+   ============================================================ */
+
+section("十四、本地模型适配器（Ollama）");
+{
+  const { createOllamaAdapter } = await import("../core/llm/ollama");
+  const { LLMUnavailableError } = await import("../core/llm/anthropic");
+  const { TOOL_DEFINITIONS } = await import("../core/tools/definitions");
+
+  /** 把若干段文本当成网络 chunk 依次吐出。段边界是**故意的**，后面按需要切碎 */
+  function replyOf(chunks: string[], status = 200): Response {
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        for (const ch of chunks) c.enqueue(encoder.encode(ch));
+        c.close();
+      },
+    });
+    return new Response(body, { status });
+  }
+
+  /** 记录请求体，顺便让每个用例自己决定回什么 */
+  // 用数组而不是 `let x = null`：后者会被 TS 的控制流收窄成 never
+  // （赋值发生在闭包里，TS 看不见），读的时候报「属性不存在于 never」。
+  // 这是把测试数据放在闭包里捕获时的固定坑，不是类型错。
+  const captured: { url: string; body: Record<string, unknown> }[] = [];
+  function stub(chunks: string[] | (() => Response), status = 200): typeof fetch {
+    return (async (url: string, init?: RequestInit) => {
+      captured.push({ url: String(url), body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown> });
+      return typeof chunks === "function" ? chunks() : replyOf(chunks, status);
+    }) as unknown as typeof fetch;
+  }
+
+  const req = { system: "S", history: [], userText: "我的订单" };
+  /** 一个正常的、工具调用与文本混在一条流里的回复 */
+  const normalLines = [
+    `{"message":{"content":"好的，"}}\n`,
+    `{"message":{"content":"正在查"}}\n`,
+    `{"message":{"content":"。","tool_calls":[{"function":{"name":"show_order_table","arguments":{"timeRange":"last30d"}}}]}}\n`,
+    `{"done":true,"done_reason":"stop","prompt_eval_count":812,"eval_count":37}\n`,
+  ];
+
+  /* ---------- 正常路径 ---------- */
+
+  {
+    const adapter = createOllamaAdapter({ fetchImpl: stub(normalLines) });
+    const deltas: string[] = [];
+    const decision = await adapter.decide(req, { onTextDelta: (d) => deltas.push(d) });
+
+    assert("Ollama：文本按顺序增量回调，拼接后等于完整回复", deltas.join("") === "好的，正在查。", deltas.join(""));
+    assert(
+      "Ollama：工具调用被解析成 name + input 对象（不是把字符串原样透传）",
+      decision.toolCalls.length === 1 && decision.toolCalls[0].name === "show_order_table" && decision.toolCalls[0].input.timeRange === "last30d",
+      JSON.stringify(decision.toolCalls),
+    );
+    assert(
+      "Ollama：每次调用都有非空的 id —— 空串会让 trace 里所有调用长得一样，按 ID 对账就失效了",
+      decision.toolCalls.every((c) => c.id.length > 0),
+      decision.toolCalls.map((c) => c.id).join(","),
+    );
+    assert(
+      "Ollama：usage 取的是 prompt_eval_count / eval_count，不是照抄别家的字段名",
+      decision.usage?.inputTokens === 812 && decision.usage?.outputTokens === 37,
+      JSON.stringify(decision.usage),
+    );
+    assert(
+      "Ollama：请求打到 /api/chat，且 stream 为 true（假流式会让 SSE 层白等）",
+      captured.at(-1)?.url === "http://127.0.0.1:11434/api/chat" && captured.at(-1)?.body.stream === true,
+      captured.at(-1)?.url ?? "（没发出请求）",
+    );
+  }
+
+  /* ---------- 按行切：一个 JSON 横跨两个 chunk ---------- */
+
+  {
+    // 把正常的那条流整个压成一串，再从**中间**随机切开 —— 切口不落在换行处。
+    // 这是「按 chunk 解析」那种写法一定挂、而按行切不会挂的场景。
+    const whole = normalLines.join("");
+    const cut = 73; // 落在某条 JSON 中间
+    const adapter = createOllamaAdapter({ fetchImpl: stub([whole.slice(0, cut), whole.slice(cut)]) });
+    const decision = await adapter.decide(req);
+
+    assert(
+      "Ollama：一条 JSON 报文横跨两个网络 chunk 时仍能解析（按行切，不是按 chunk 切）",
+      decision.toolCalls.length === 1 && decision.toolCalls[0].input.timeRange === "last30d",
+      `切口在 ${cut}：${JSON.stringify(decision.toolCalls)}`,
+    );
+    assert("Ollama：跨 chunk 时文本也没丢字", decision.text === "好的，正在查。", decision.text);
+  }
+
+  /* ---------- 最后一行没有换行符 ---------- */
+
+  {
+    const noTrailingNl = normalLines.map((l) => l.replace(/\n$/, ""));
+    // 只有最后一条带换行，其余都不带 —— 整个流就是一行「没被换行收尾」的
+    const joined = noTrailingNl.join("\n");
+    const adapter = createOllamaAdapter({ fetchImpl: stub([joined]) });
+    const decision = await adapter.decide(req);
+    assert(
+      "Ollama：最后一行没有换行符收尾时也要处理（丢掉它等于丢掉 done 和 usage）",
+      decision.usage?.outputTokens === 37,
+      JSON.stringify(decision.usage),
+    );
+  }
+
+  /* ---------- arguments 的两种形状 ---------- */
+
+  {
+    const asString = [`{"message":{"content":"","tool_calls":[{"function":{"name":"show_refund_form","arguments":"{\\"orderNo\\":\\"SO-20260910-6620\\"}"}}]}}\n`, `{"done":true,"done_reason":"stop"}\n`];
+    const adapter = createOllamaAdapter({ fetchImpl: stub(asString) });
+    const decision = await adapter.decide(req);
+    assert(
+      "Ollama：arguments 是 JSON **字符串**时也能解析（本机永远给对象，这条分支在真机上是死代码）",
+      decision.toolCalls[0]?.input.orderNo === "SO-20260910-6620",
+      JSON.stringify(decision.toolCalls[0]?.input),
+    );
+  }
+
+  {
+    const badJson = [`{"message":{"tool_calls":[{"function":{"name":"show_refund_form","arguments":"{半截"}}]}}\n`, `{"done":true}\n`];
+    const adapter = createOllamaAdapter({ fetchImpl: stub(badJson) });
+    const decision = await adapter.decide(req);
+    assert(
+      "Ollama：拼不出来的参数给空对象，**不替模型编一个默认值**（缺必填字段交给闸1 拒）",
+      decision.toolCalls[0]?.input !== null && Object.keys(decision.toolCalls[0].input).length === 0,
+      JSON.stringify(decision.toolCalls[0]?.input),
+    );
+  }
+
+  /* ---------- 坏行 ---------- */
+
+  {
+    const withGarbage = [`{"message":{"content":"前半"}}\n`, `这不是 JSON\n`, `{"message":{"content":"后半"}}\n`, `{"done":true,"done_reason":"stop"}\n`];
+    const adapter = createOllamaAdapter({ fetchImpl: stub(withGarbage) });
+    const decision = await adapter.decide(req);
+    assert(
+      "Ollama：中间夹一行坏报文时跳过它继续读（不是整轮抛错 —— 数据已经流了一部分给用户了）",
+      decision.text === "前半后半",
+      decision.text,
+    );
+  }
+
+  /* ---------- thinking 不转发 ---------- */
+
+  {
+    const withThinking = [`{"message":{"thinking":"用户想要订单，我该用 show_order_table……","content":"好的"}}\n`, `{"done":true,"done_reason":"stop"}\n`];
+    const adapter = createOllamaAdapter({ fetchImpl: stub(withThinking) });
+    const deltas: string[] = [];
+    const decision = await adapter.decide(req, { onTextDelta: (d) => deltas.push(d) });
+    assert(
+      "Ollama：thinking 不进 onTextDelta（模型纠结用哪个工具，不该让用户看见）",
+      deltas.join("") === "好的" && !decision.text.includes("show_order_table"),
+      deltas.join("") || "（没有 delta）",
+    );
+  }
+
+  /* ---------- 失败路径 ---------- */
+
+  {
+    const truncated = [`{"message":{"content":"好的，我帮你"} }\n`, `{"done":true,"done_reason":"length"}\n`];
+    const adapter = createOllamaAdapter({ fetchImpl: stub(truncated) });
+    let err: unknown = null;
+    try {
+      await adapter.decide(req);
+    } catch (e) {
+      err = e;
+    }
+    assert(
+      "Ollama：done_reason=length 当成截断抛出（截断的参数可能是半截的，不能当正常结果执行）",
+      err instanceof LLMUnavailableError && String((err as Error).message).includes("截断"),
+      String((err as Error).message ?? err),
+    );
+  }
+
+  {
+    const adapter = createOllamaAdapter({ fetchImpl: stub(() => new Response("model 'qwen2.5:3b' not found", { status: 404 })) });
+    let err: unknown = null;
+    try {
+      await adapter.decide(req);
+    } catch (e) {
+      err = e;
+    }
+    const msg = String((err as Error)?.message ?? "");
+    assert(
+      "Ollama：404（模型没拉）抛 LLMUnavailableError，且提示里带 `ollama pull` —— 这是最常见的失败，让人一眼知道下一步做什么",
+      err instanceof LLMUnavailableError && msg.includes("ollama pull"),
+      msg || String(err),
+    );
+  }
+
+  {
+    const adapter = createOllamaAdapter({
+      baseUrl: "http://127.0.0.1:59999",
+      fetchImpl: (async () => {
+        throw new Error("ECONNREFUSED");
+      }) as unknown as typeof fetch,
+    });
+    let err: unknown = null;
+    try {
+      await adapter.decide(req);
+    } catch (e) {
+      err = e;
+    }
+    const msg = String((err as Error)?.message ?? "");
+    assert(
+      "Ollama：连不上时抛 LLMUnavailableError，且消息里带地址（不然用户不知道它在连哪儿）",
+      err instanceof LLMUnavailableError && msg.includes("127.0.0.1:59999"),
+      msg || String(err),
+    );
+  }
+
+  {
+    // 一个永远不关闭的流 + 很短的超时：模拟 CPU 上加载权重时读不动。
+    // 这条断言守的不是「会不会超时」，是「超时之后抛的是不是那个能被网关认出来的错误」——
+    // 漏出去一个裸的 AbortError，用户拿到的就不是「稍后再试」而是一次没有兜底的失败。
+    const hanging = (async (_url: string, init?: RequestInit) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(c) {
+          c.enqueue(new TextEncoder().encode(`{"message":{"content":"好"}}\n`));
+          // 故意不 close
+          //
+          // `signal` 必须自己接上 —— 真的 fetch 会在 abort 时把这个流打断，
+          // 假的不会。第一版就是漏了这一句，于是这个用例**永远不结束**
+          // （settled 不了的 top-level await），而不是失败。假传输层少接一根线，
+          // 测出来的就不是「超时被处理了」，是「这个测试挂了」。
+          init?.signal?.addEventListener("abort", () => c.error(new Error("aborted")));
+        },
+      });
+      return new Response(body, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const adapter = createOllamaAdapter({ fetchImpl: hanging, timeoutMs: 120 });
+    let err: unknown = null;
+    try {
+      await adapter.decide(req);
+    } catch (e) {
+      err = e;
+    }
+    assert(
+      "Ollama：超时中止抛的是 LLMUnavailableError（网关只认它来降级，漏出裸 AbortError 就没有兜底了）",
+      err instanceof LLMUnavailableError && String((err as Error).message).includes("没读完"),
+      String((err as Error)?.message ?? err),
+    );
+  }
+
+  /* ---------- 工具 schema 与内部定义是同一份 ---------- */
+
+  {
+    const adapter = createOllamaAdapter({ fetchImpl: stub(normalLines) });
+    await adapter.decide(req);
+    const tools = (captured.at(-1)?.body.tools ?? []) as { type: string; function: { name: string; parameters: unknown } }[];
+    const canon = (v: unknown): string => {
+      if (Array.isArray(v)) return `[${v.map(canon).join(",")}]`;
+      if (v !== null && typeof v === "object") {
+        const o = v as Record<string, unknown>;
+        return `{${Object.keys(o).sort().map((k) => `${k}:${canon(o[k])}`).join(",")}}`;
+      }
+      return JSON.stringify(v);
+    };
+    const drifted = tools.filter((t) => {
+      const def = TOOL_DEFINITIONS.find((d) => d.name === t.function.name);
+      return !def || canon(def.input_schema) !== canon(t.function.parameters);
+    });
+    assert(
+      "Ollama：传出去的是 OpenAI 风格的 function 包装，且 parameters 就是内部那份 input_schema（不是各写一份）",
+      tools.length === TOOL_DEFINITIONS.length && tools.every((t) => t.type === "function") && drifted.length === 0,
+      drifted.map((t) => t.function.name).join(",") || `${tools.length} 个工具`,
+    );
+    assert(
+      "Ollama：工具定义里**不带** Anthropic 专有的 strict 字段（带了是另一家的形状，纯属噪音）",
+      tools.every((t) => !("strict" in t) && !("input_schema" in t)),
+    );
+  }
+
+  /* ---------- provider 选择 ---------- */
+
+  {
+    const { resolveProvider } = await import("../core/llm");
+    const prev = process.env.LLM_PROVIDER;
+    process.env.LLM_PROVIDER = "ollama";
+    const ok = resolveProvider();
+    process.env.LLM_PROVIDER = "olamma"; // 拼错一个字母
+    let err: unknown = null;
+    try {
+      resolveProvider();
+    } catch (e) {
+      err = e;
+    }
+    process.env.LLM_PROVIDER = prev;
+    assert("provider：LLM_PROVIDER=ollama 被认识", ok === "ollama", ok);
+    assert(
+      "provider：拼错的 provider 名直接抛错，**不静默退回 mock** —— 静默回退会跑出一个和真模型无关的漂亮 100%",
+      err !== null && String((err as Error).message).includes("不认识"),
+      err === null ? "（居然没抛，说明回退了）" : String((err as Error).message),
+    );
+  }
+
+  /* ---------- 两道超时的**先后顺序** ---------- */
+
+  {
+    // 这一条守的不是某个值，是两个默认值之间的**关系**。
+    //
+    // 网关的 withTimeout(…, TIMEOUTS.llm) 是外层，适配器的 OLLAMA_TIMEOUT_MS 是内层。
+    // 只有内层知道「这是本地模型」，也只有它能给出可执行的那句提示
+    // （超时调大 / 权重还在加载）。外层先到，用户拿到的是一句
+    // 「llm.decide 超过 30000ms 未返回」—— 正确，但没法照着做。
+    //
+    // 上一版把适配器默认写成 60s（> 外层 30s），于是内层超时在默认配置下
+    // **一次都不会执行**。selftest 里那条超时用例没拦住它，因为它注入的是 120ms ——
+    // 「分支本身对不对」和「默认值之间的关系对不对」是两个问题，这一条管后者。
+    // 这个 bug 是真模型冒烟跑出来的，不是这里。
+    const { resolveTimeoutMs } = await import("../core/llm/ollama");
+    const { TIMEOUTS } = await import("../core/runtime");
+    // 比的是**当前生效**的值，不是出厂默认值 —— 用户改了 OLLAMA_TIMEOUT_MS
+    // 却忘了同步改 LLM_TIMEOUT_MS 的时候，只有比生效值才拦得住。
+    assert(
+      "Ollama：适配器超时**严格小于**网关的 LLM_TIMEOUT_MS —— 否则内层那条带提示的超时永不触发，写在里面的排查话一句也到不了用户面前",
+      resolveTimeoutMs() < TIMEOUTS.llm,
+      `适配器 ${resolveTimeoutMs()}ms vs 网关 ${TIMEOUTS.llm}ms`,
+    );
+  }
+}
+
+/* ============================================================
    汇总
    ============================================================ */
 
