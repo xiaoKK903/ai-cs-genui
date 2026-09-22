@@ -39,17 +39,32 @@
  * 字段名、`done_reason`、请求形状（`/api/chat` + `stream: true` + OpenAI 风格
  * `tools`）—— `npm run check:model` 跑通一轮，usage 记到 782 in / 28 out。
  *
- * **真机上没验过的：工具调用那条路。** qwen2.5:3b 在这套 system prompt + 四个
- * 工具下，产不出结构化的 `tool_calls`（返回 `null`），而是把 Qwen 的原生标记
+ * **真机上没验过的：工具调用那条路 —— 两个 3B 模型都试过，都不行。**
+ *
+ * qwen2.5:3b：产不出结构化的 `tool_calls`（返回 `null`），而是把自己发明的标记
  * 当普通文本吐进 `content`：
  *
- *     <tools>
- *     {"name": show_order_table, "arguments": <args{"timeRange": "last30d", ...}}>}
+ *     <tools>{"name": show_order_table, "arguments": <args{"timeRange": "last30d"}>}</tools>
+ *     <show_order_table arguments: <{"timeRange": "last30d", "statusFilter": "all"}>}
  *
- * 模板本身是对的（`/api/show` 里 `.Tools` 段齐全，`capabilities` 含 `tools`），
- * 是模型没照着它给的 `<tool_call>` 格式写 —— 属于模型能力，不是协议问题。
- * 后果是：`normalizeArguments`、按序号归并 `calls`、合成调用 ID 这几段，
- * 在真机上全是**死代码**，只有注入的桩在跑它们。别把它读成「真机验过了」。
+ * （两次跑出来的是两种不同的错法 —— 它连自己上次的错法都没稳定复现。）
+ *
+ * llama3.2:3b：**在这台机器上根本跑不动**。连「回复一个字：好」这种极简 prompt
+ * 都会退化成重复输出，被 Ollama 的重复保护掐掉：
+ * `prediction aborted, token repeat limit reached`。不给工具也一样，所以不是
+ * 工具格式的问题。3B 的这个循环很可能是 rope/量化在这个 llama.cpp 构建上的问题，
+ * 但要真断定得再花时间 —— 结论就是它在这里不可用。
+ *
+ * 排查中顺手证伪了一个很像的原因，写在这里省得后人重走：**不是 system prompt 里
+ * 那份散文工具名清单（`show_order_table / show_refund_form / ...`）把模型带偏的。**
+ * 把那份清单从 prompt 里去掉之后，模型照样不按 `<tool_call>` 写，而且错得更差
+ * （开始重复函数名）。所以那份清单不用动 —— 它是白名单纪律的一部分，
+ * 有它自己的来处。
+ *
+ * 模板本身是对的（`/api/show` 里 `.Tools` 段齐全、`capabilities` 含 `tools`），
+ * 所以这是**模型能力**问题，不是协议问题。但「不是协议问题」不等于「验过了」：
+ * `normalizeArguments`、按序号归并 `calls`、合成调用 ID 这几段代码，在真机上
+ * 至今**一行都没执行过**，只有注入的桩在跑它们。
  *
  * ## 小模型跑评测的意义要说清楚
  *
